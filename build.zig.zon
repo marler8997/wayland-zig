@@ -1,0 +1,20 @@
+.{
+    .name = .wayland,
+    .fingerprint = 0xa8d655eb9ab5d9e,
+    .version = "0.0.0",
+    .zig_version = "0.15.2",
+    .minimum_zig_version = "0.14.0",
+    .dependencies = .{
+        // TODO: probably reference protocol/wayland.xml to generate code in the future
+        // .wayland = .{
+        //     .url = "https://gitlab.freedesktop.org/wayland/wayland/-/releases/1.24.0/downloads/wayland-1.24.0.tar.xz",
+        //     .hash = "N-V-__8AAGoeGQBEn6KguTJUXrCE0tIRrrXfQX7hYHoKCJwZ",
+        // },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "examples",
+        "src",
+    },
+}
