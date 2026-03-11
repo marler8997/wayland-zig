@@ -319,6 +319,12 @@ pub const xdg_toplevel = struct {
         pub const configure_bounds = 2;
         pub const wm_capabilities = 3;
     };
+    pub fn set_fullscreen(writer: *Writer, toplevel_id: object, output_id: ?object) error{WriteFailed}!void {
+        const msg_len: u16 = 12;
+        try writer.writeInt(u32, @intFromEnum(toplevel_id), native_endian);
+        try writer.writeInt(u32, @bitCast(SizeOpcode{ .size = msg_len, .opcode = 11 }), native_endian);
+        try writer.writeInt(u32, @intFromEnum(output_id orelse .null), native_endian);
+    }
     pub fn set_title(writer: *Writer, toplevel_id: object, title: []const u8) error{WriteFailed}!void {
         const str_len: u32 = @intCast(title.len + 1); // includes null terminator
         const padded_str_len = std.mem.alignForward(u32, str_len, 4);
