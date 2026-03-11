@@ -298,6 +298,11 @@ pub const xdg_surface = struct {
     pub const event = struct {
         pub const configure = 0;
     };
+    pub fn destroy(writer: *Writer, xdg_surface_id: object) error{WriteFailed}!void {
+        const msg_len: u16 = 8;
+        try writer.writeInt(u32, @intFromEnum(xdg_surface_id), native_endian);
+        try writer.writeInt(u32, @bitCast(SizeOpcode{ .size = msg_len, .opcode = 0 }), native_endian);
+    }
     pub fn get_toplevel(writer: *Writer, xdg_surface_id: object, toplevel_id: object) error{WriteFailed}!void {
         const msg_len: u16 = 12;
         try writer.writeInt(u32, @intFromEnum(xdg_surface_id), native_endian);
@@ -319,6 +324,11 @@ pub const xdg_toplevel = struct {
         pub const configure_bounds = 2;
         pub const wm_capabilities = 3;
     };
+    pub fn destroy(writer: *Writer, toplevel_id: object) error{WriteFailed}!void {
+        const msg_len: u16 = 8;
+        try writer.writeInt(u32, @intFromEnum(toplevel_id), native_endian);
+        try writer.writeInt(u32, @bitCast(SizeOpcode{ .size = msg_len, .opcode = 0 }), native_endian);
+    }
     pub fn set_fullscreen(writer: *Writer, toplevel_id: object, output_id: ?object) error{WriteFailed}!void {
         const msg_len: u16 = 12;
         try writer.writeInt(u32, @intFromEnum(toplevel_id), native_endian);
@@ -647,6 +657,11 @@ pub const layer_surface = struct {
         try writer.writeInt(u32, @intFromEnum(layer_surface_id), native_endian);
         try writer.writeInt(u32, @bitCast(SizeOpcode{ .size = msg_len, .opcode = 4 }), native_endian);
         try writer.writeInt(u32, interactivity, native_endian);
+    }
+    pub fn destroy(writer: *Writer, layer_surface_id: object) error{WriteFailed}!void {
+        const msg_len: u16 = 8;
+        try writer.writeInt(u32, @intFromEnum(layer_surface_id), native_endian);
+        try writer.writeInt(u32, @bitCast(SizeOpcode{ .size = msg_len, .opcode = 5 }), native_endian);
     }
     pub fn ack_configure(writer: *Writer, layer_surface_id: object, serial: u32) error{WriteFailed}!void {
         const msg_len: u16 = 12;
