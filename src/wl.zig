@@ -393,6 +393,13 @@ pub const surface = struct {
         try writer.writeInt(u32, @intFromEnum(surface_id), native_endian);
         try writer.writeInt(u32, @bitCast(SizeOpcode{ .size = msg_len, .opcode = 6 }), native_endian);
     }
+    // set_buffer_transform opcode 7
+    pub fn set_buffer_scale(writer: *Writer, surface_id: object, scale: i32) error{WriteFailed}!void {
+        const msg_len: u16 = 12;
+        try writer.writeInt(u32, @intFromEnum(surface_id), native_endian);
+        try writer.writeInt(u32, @bitCast(SizeOpcode{ .size = msg_len, .opcode = 8 }), native_endian);
+        try writer.writeInt(i32, scale, native_endian);
+    }
     pub fn damage_buffer(
         writer: *Writer,
         surface_id: object,
@@ -409,6 +416,18 @@ pub const surface = struct {
         try writer.writeInt(i32, width, native_endian);
         try writer.writeInt(i32, height, native_endian);
     }
+};
+
+pub const output = struct {
+    pub const version = 4;
+    pub const event = struct {
+        pub const geometry = 0;
+        pub const mode = 1;
+        pub const done = 2;
+        pub const scale = 3;
+        pub const name = 4;
+        pub const description = 5;
+    };
 };
 
 pub const region = struct {
@@ -635,6 +654,48 @@ pub const layer_surface = struct {
         try writer.writeInt(u32, @bitCast(SizeOpcode{ .size = msg_len, .opcode = 6 }), native_endian);
         try writer.writeInt(u32, serial, native_endian);
     }
+};
+
+pub const viewporter = struct {
+    pub const version = 1;
+    // destroy opcode 0
+    pub fn get_viewport(writer: *Writer, viewporter_id: object, viewport_id: object, surface_id: object) error{WriteFailed}!void {
+        const msg_len: u16 = 16;
+        try writer.writeInt(u32, @intFromEnum(viewporter_id), native_endian);
+        try writer.writeInt(u32, @bitCast(SizeOpcode{ .size = msg_len, .opcode = 1 }), native_endian);
+        try writer.writeInt(u32, @intFromEnum(viewport_id), native_endian);
+        try writer.writeInt(u32, @intFromEnum(surface_id), native_endian);
+    }
+};
+
+pub const viewport = struct {
+    // destroy opcode 0
+    // set_source opcode 1 (fixed-point, not needed for now)
+    pub fn set_destination(writer: *Writer, viewport_id: object, width: i32, height: i32) error{WriteFailed}!void {
+        const msg_len: u16 = 16;
+        try writer.writeInt(u32, @intFromEnum(viewport_id), native_endian);
+        try writer.writeInt(u32, @bitCast(SizeOpcode{ .size = msg_len, .opcode = 2 }), native_endian);
+        try writer.writeInt(i32, width, native_endian);
+        try writer.writeInt(i32, height, native_endian);
+    }
+};
+
+pub const fractional_scale_manager = struct {
+    pub const version = 1;
+    // destroy opcode 0
+    pub fn get_fractional_scale(writer: *Writer, manager_id: object, fractional_scale_id: object, surface_id: object) error{WriteFailed}!void {
+        const msg_len: u16 = 16;
+        try writer.writeInt(u32, @intFromEnum(manager_id), native_endian);
+        try writer.writeInt(u32, @bitCast(SizeOpcode{ .size = msg_len, .opcode = 1 }), native_endian);
+        try writer.writeInt(u32, @intFromEnum(fractional_scale_id), native_endian);
+        try writer.writeInt(u32, @intFromEnum(surface_id), native_endian);
+    }
+};
+
+pub const fractional_scale = struct {
+    pub const event = struct {
+        pub const preferred_scale = 0; // uint32: scale * 120
+    };
 };
 
 pub fn Cmsg(comptime T: type) type {
