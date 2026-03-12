@@ -78,11 +78,11 @@ fn go(
                     try reader.discardAll(interface_word_count * 4 - interface.len);
                     const version = try reader.takeInt(u32, wl.native_endian);
                     std.log.info("registry: name={} interface='{s}' version={}", .{ name, interface, version });
-                    if (std.mem.eql(u8, interface, "wl_shm")) {
+                    if (std.mem.eql(u8, interface, wl.shm.name)) {
                         maybe_shm_name = name;
-                    } else if (std.mem.eql(u8, interface, "wl_compositor")) {
+                    } else if (std.mem.eql(u8, interface, wl.compositor.name)) {
                         maybe_compositor_name = name;
-                    } else if (std.mem.eql(u8, interface, "zwlr_layer_shell_v1")) {
+                    } else if (std.mem.eql(u8, interface, wl.layer_shell.name)) {
                         maybe_layer_shell_name = name;
                     }
                 },
@@ -104,19 +104,19 @@ fn go(
         std.log.err("no wl_compositor", .{});
         std.process.exit(0xff);
     };
-    try wl.registry.bind(writer, ids.get(.registry), compositor_name, "wl_compositor", wl.compositor.version, ids.new(.compositor));
+    try wl.registry.bind(writer, ids.get(.registry), compositor_name, wl.compositor.name, wl.compositor.version, ids.new(.compositor));
 
     const shm_name = maybe_shm_name orelse {
         std.log.err("no wl_shm", .{});
         std.process.exit(0xff);
     };
-    try wl.registry.bind(writer, ids.get(.registry), shm_name, "wl_shm", wl.shm.version, ids.new(.shm));
+    try wl.registry.bind(writer, ids.get(.registry), shm_name, wl.shm.name, wl.shm.version, ids.new(.shm));
 
     const layer_shell_name = maybe_layer_shell_name orelse {
         std.log.err("no zwlr_layer_shell_v1 — compositor does not support wlr-layer-shell", .{});
         std.process.exit(0xff);
     };
-    try wl.registry.bind(writer, ids.get(.registry), layer_shell_name, "zwlr_layer_shell_v1", wl.layer_shell.version, ids.new(.layer_shell));
+    try wl.registry.bind(writer, ids.get(.registry), layer_shell_name, wl.layer_shell.name, wl.layer_shell.version, ids.new(.layer_shell));
 
     // Create surface
     try wl.compositor.create_surface(writer, ids.get(.compositor), ids.new(.surface));
@@ -136,7 +136,7 @@ fn go(
     try wl.layer_surface.set_anchor(writer, ids.get(.layer_surface), 15); // top|bottom|left|right
     try wl.layer_surface.set_size(writer, ids.get(.layer_surface), 0, 0); // compositor decides
     try wl.layer_surface.set_exclusive_zone(writer, ids.get(.layer_surface), -1);
-    try wl.layer_surface.set_keyboard_interactivity(writer, ids.get(.layer_surface), 0);
+    try wl.layer_surface.set_keyboard_interactivity(writer, ids.get(.layer_surface), .none);
 
     // Create empty region for input passthrough
     try wl.compositor.create_region(writer, ids.get(.compositor), ids.new(.wl_region));

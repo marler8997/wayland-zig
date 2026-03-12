@@ -5,16 +5,24 @@
     .zig_version = "0.15.2",
     .minimum_zig_version = "0.14.0",
     .dependencies = .{
-        // TODO: probably reference protocol/wayland.xml to generate code in the future
-        // .wayland = .{
-        //     .url = "https://gitlab.freedesktop.org/wayland/wayland/-/releases/1.24.0/downloads/wayland-1.24.0.tar.xz",
-        //     .hash = "N-V-__8AAGoeGQBEn6KguTJUXrCE0tIRrrXfQX7hYHoKCJwZ",
-        // },
+        .wayland = .{
+            .url = "https://gitlab.freedesktop.org/wayland/wayland/-/releases/1.24.0/downloads/wayland-1.24.0.tar.xz",
+            .hash = "N-V-__8AAGoeGQBEn6KguTJUXrCE0tIRrrXfQX7hYHoKCJwZ",
+        },
+        .@"wayland-protocols" = .{
+            .url = "https://gitlab.freedesktop.org/wayland/wayland-protocols/-/releases/1.39/downloads/wayland-protocols-1.39.tar.xz",
+            .hash = "N-V-__8AALA-DABZYbeDEV9ie5H33N4lfMksPuJuZXLPPO2V",
+        },
+        .@"wlr-protocols" = .{
+            .url = "https://gitlab.freedesktop.org/wlroots/wlr-protocols/-/archive/a741f0ac5d655338a5100fc34bc8cec87d237346/wlr-protocols-master.tar.gz",
+            .hash = "N-V-__8AAMm4AQANnGv8ZhQ9FX_ipu-oul8H7XP9WPD6r5KD",
+        },
     },
     .paths = .{
         "build.zig",
         "build.zig.zon",
         "examples",
+        "scanner",
         "src",
     },
 }

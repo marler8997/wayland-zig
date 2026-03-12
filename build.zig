@@ -1,4 +1,3 @@
-const builtin = @import("builtin");
 const std = @import("std");
 
 const examples = [_][]const u8{
@@ -10,10 +9,39 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
+    const wayland_dep = b.dependency("wayland", .{});
+    const wayland_protocols_dep = b.dependency("wayland-protocols", .{});
+    const wlr_protocols_dep = b.dependency("wlr-protocols", .{});
+
+    const generated_mod = blk: {
+        const scanner = b.addExecutable(.{
+            .name = "wayland-scanner",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("scanner/scanner.zig"),
+                .target = b.graph.host,
+            }),
+        });
+        const run = b.addRunArtifact(scanner);
+        run.addFileArg(wayland_dep.path("protocol/wayland.xml"));
+        run.addFileArg(wayland_protocols_dep.path("stable/xdg-shell/xdg-shell.xml"));
+        run.addFileArg(wayland_protocols_dep.path("stable/linux-dmabuf/linux-dmabuf-v1.xml"));
+        run.addFileArg(wayland_protocols_dep.path("stable/viewporter/viewporter.xml"));
+        run.addFileArg(wlr_protocols_dep.path("unstable/wlr-layer-shell-unstable-v1.xml"));
+        run.addArg("-o");
+        const generated_file = run.addOutputFileArg("generated_wl.zig");
+        b.getInstallStep().dependOn(&b.addInstallFile(generated_file, "src/generated_wl.zig").step);
+        break :blk b.createModule(.{
+            .root_source_file = generated_file,
+        });
+    };
+
     // In almost all cases, Zig programs should only use this module, not the
     // library defined below, that's for C programs.
     const wl_mod = b.addModule("wl", .{
         .root_source_file = b.path("src/wl.zig"),
+        .imports = &.{
+            .{ .name = "generated", .module = generated_mod },
+        },
     });
 
     const test_step = b.step("test", "Run all tests and interactive examples)");
@@ -53,6 +81,9 @@ pub fn build(b: *std.Build) void {
             .root_module = b.createModule(.{
                 .root_source_file = b.path("src/wl.zig"),
                 .target = target,
+                .imports = &.{
+                    .{ .name = "generated", .module = generated_mod },
+                },
             }),
         });
         const run = b.addRunArtifact(unit_tests);

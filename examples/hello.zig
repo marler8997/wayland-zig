@@ -79,19 +79,19 @@ fn go(
                     try reader.discardAll(interface_word_count * 4 - interface.len);
                     const version = try reader.takeInt(u32, wl.native_endian);
                     std.log.info("registry event global name={} interface='{s}' version={}", .{ name, interface, version });
-                    if (std.mem.eql(u8, interface, "wl_shm")) {
+                    if (std.mem.eql(u8, interface, wl.shm.name)) {
                         if (maybe_shm != null) {
                             std.log.err("got wl_shm multiple times", .{});
                             return error.WaylandProtocol;
                         }
                         maybe_shm = .{ .name = name, .version = version };
-                    } else if (std.mem.eql(u8, interface, "wl_compositor")) {
+                    } else if (std.mem.eql(u8, interface, wl.compositor.name)) {
                         if (maybe_compositor != null) {
                             std.log.err("got wl_compositor multiple times", .{});
                             return error.WaylandProtocol;
                         }
                         maybe_compositor = .{ .name = name, .version = version };
-                    } else if (std.mem.eql(u8, interface, "xdg_wm_base")) {
+                    } else if (std.mem.eql(u8, interface, wl.xdg_wm_base.name)) {
                         if (maybe_xdg_wm_base != null) {
                             std.log.err("got xdg_wm_base multiple times", .{});
                             return error.WaylandProtocol;
@@ -125,7 +125,7 @@ fn go(
         writer,
         ids.get(.registry),
         compositor_global.name,
-        "wl_compositor",
+        wl.compositor.name,
         @min(wl.compositor.version, compositor_global.version),
         ids.new(.compositor),
     );
@@ -138,7 +138,7 @@ fn go(
         writer,
         ids.get(.registry),
         shm_global.name,
-        "wl_shm",
+        wl.shm.name,
         @min(wl.shm.version, shm_global.version),
         ids.new(.shm),
     );
@@ -151,7 +151,7 @@ fn go(
         writer,
         ids.get(.registry),
         xdg_wm_base_global.name,
-        "xdg_wm_base",
+        wl.xdg_wm_base.name,
         @min(wl.xdg_wm_base.version, xdg_wm_base_global.version),
         ids.new(.xdg_wm_base),
     );
