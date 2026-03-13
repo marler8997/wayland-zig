@@ -324,6 +324,20 @@ fn handleEvent(
             },
             else => std.debug.panic("unhandled xdg_toplevel event opcode={}", .{opcode}),
         },
+        .surface => switch (opcode) {
+            wl.surface.event.enter, wl.surface.event.leave => {
+                try reader.discardAll(size - 8);
+            },
+            wl.surface.event.preferred_buffer_scale => {
+                const factor = try reader.takeInt(i32, wl.native_endian);
+                std.log.info("surface preferred_buffer_scale factor={}", .{factor});
+            },
+            wl.surface.event.preferred_buffer_transform => {
+                const transform = try reader.takeInt(u32, wl.native_endian);
+                std.log.info("surface preferred_buffer_transform transform={}", .{transform});
+            },
+            else => std.debug.panic("unhandled surface event opcode={}", .{opcode}),
+        },
         .buffer => {
             // wl_buffer.release
             std.log.info("buffer release (size={})", .{size});
