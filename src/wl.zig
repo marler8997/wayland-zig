@@ -320,18 +320,18 @@ pub fn IdTable(comptime IdEnum: type) type {
             [1]ObjId{1} ++
             ([1]ObjId{0} ** count_after_display),
         obj_to_enum: [capacity]IdEnum = [1]IdEnum{.display} ++ ([1]IdEnum{undefined} ** (capacity - 1)),
-        next_id: Count = 2,
+        last_id: Count = 1,
 
         const Self = @This();
 
         pub fn new(table: *Self, id: IdEnum) object {
             std.debug.assert(table.enum_to_obj[@intFromEnum(id)] == 0);
-            std.debug.assert(table.next_id <= capacity);
+            const obj_id = table.last_id + 1;
+            std.debug.assert(obj_id <= capacity);
 
-            const obj_id = table.next_id;
             table.enum_to_obj[@intFromEnum(id)] = obj_id;
             table.obj_to_enum[obj_id - 1] = id;
-            table.next_id += 1;
+            table.last_id = obj_id;
             return @enumFromInt(obj_id);
         }
 
@@ -343,7 +343,7 @@ pub fn IdTable(comptime IdEnum: type) type {
 
         pub fn lookup(table: *const Self, o: object) IdEnum {
             const raw = @intFromEnum(o);
-            std.debug.assert(raw >= 1 and raw < table.next_id);
+            std.debug.assert(raw >= 1 and raw <= table.last_id);
             return table.obj_to_enum[raw - 1];
         }
     };
