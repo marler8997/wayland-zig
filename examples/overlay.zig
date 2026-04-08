@@ -32,40 +32,48 @@ pub fn main() !void {
     };
 }
 
-const Id = enum {
-    display,
-    registry,
-    callback,
-    compositor,
-    shm,
-    layer_shell,
-    surface,
-    layer_surface,
-    wl_region,
-    shm_pool,
-    buffer,
-    frame_callback,
-};
+const Ids = wl.Ids(&.{
+    .{ .display, .wl_display },
+    .{ .registry, .wl_registry },
+    .{ .sync_callback, .wl_callback },
+    .{ .compositor, .wl_compositor },
+    .{ .shm, .wl_shm },
+    .{ .layer_shell, .zwlr_layer_shell_v1 },
+    .{ .surface, .wl_surface },
+    .{ .layer_surface, .zwlr_layer_surface_v1 },
+    .{ .wl_region, .wl_region },
+    .{ .shm_pool, .wl_shm_pool },
+    .{ .buffer, .wl_buffer },
+    .{ .frame_callback, .wl_callback },
+});
 
 fn go(
     stream: std.net.Stream,
     writer: *wl.Writer,
     reader: *wl.Reader,
 ) error{ WriteFailed, ReadFailed, EndOfStream, WaylandProtocol }!void {
-    var ids: wl.IdTable(Id) = .{};
+    var ids_store: Ids.Store = .{};
+    var ids = Ids.init(&ids_store);
+    var id_recycle_stack: [16]wl.object = undefined;
+    var id_pool: wl.IdPool = .{ .next = 1, .recycle_stack = &id_recycle_stack };
 
-    try wl.display.get_registry(writer, ids.new(.registry));
-    try wl.display.sync(writer, ids.new(.callback));
+    _ = ids.new(&id_pool, .display);
+    try wl.display.get_registry(writer, ids.new(&id_pool, .registry));
+
+    try wl.display.sync(writer, ids.new(&id_pool, .sync_callback));
     try writer.flush();
 
-    var maybe_shm_name: ?u32 = null;
-    var maybe_compositor_name: ?u32 = null;
-    var maybe_layer_shell_name: ?u32 = null;
+    const Global = struct { name: u32, version: u32 };
+    var maybe_shm: ?Global = null;
+    var maybe_compositor: ?Global = null;
+    var maybe_layer_shell: ?Global = null;
 
     // Read registry globals until sync callback
     while (true) {
         const sender, const opcode, const size = try wl.readHeader(reader);
-        switch (ids.lookup(sender)) {
+        const result = ids.lookup(sender);
+        std.debug.assert(!result.dying);
+        switch (result.kind) {
             .registry => switch (opcode) {
                 wl.registry.event.global => {
                     const name = try reader.takeInt(u32, wl.native_endian);
@@ -79,53 +87,56 @@ fn go(
                     const version = try reader.takeInt(u32, wl.native_endian);
                     std.log.info("registry: name={} interface='{s}' version={}", .{ name, interface, version });
                     if (std.mem.eql(u8, interface, wl.shm.name)) {
-                        maybe_shm_name = name;
+                        maybe_shm = .{ .name = name, .version = version };
                     } else if (std.mem.eql(u8, interface, wl.compositor.name)) {
-                        maybe_compositor_name = name;
+                        maybe_compositor = .{ .name = name, .version = version };
                     } else if (std.mem.eql(u8, interface, wl.layer_shell.name)) {
-                        maybe_layer_shell_name = name;
+                        maybe_layer_shell = .{ .name = name, .version = version };
                     }
                 },
                 else => @panic("unhandled registry event"),
             },
-            .callback => switch (opcode) {
+            .sync_callback => switch (opcode) {
                 wl.callback.event.done => {
                     if (size != 12) return error.WaylandProtocol;
-                    _ = try reader.takeInt(u32, wl.native_endian);
+                    const timestamp = try reader.takeInt(u32, wl.native_endian);
+                    _ = timestamp;
+                    ids.remove(.sync_callback);
                     break;
                 },
                 else => @panic("unhandled callback event"),
             },
-            else => |sender_id| std.debug.panic("unhandled event from {t}", .{sender_id}),
+            .display => try handleDisplayEvent(&id_pool, &ids, reader, opcode),
+            else => |k| std.debug.panic("unexpected event from {s} during handshake", .{@tagName(k)}),
         }
     }
 
-    const compositor_name = maybe_compositor_name orelse {
+    const compositor_global = maybe_compositor orelse {
         std.log.err("no wl_compositor", .{});
         std.process.exit(0xff);
     };
-    try wl.registry.bind(writer, ids.get(.registry), compositor_name, wl.compositor.name, wl.compositor.version, ids.new(.compositor));
+    try wl.registry.bind(writer, ids.get(.registry), compositor_global.name, wl.compositor.name, @min(wl.compositor.version, compositor_global.version), ids.new(&id_pool, .compositor));
 
-    const shm_name = maybe_shm_name orelse {
+    const shm_global = maybe_shm orelse {
         std.log.err("no wl_shm", .{});
         std.process.exit(0xff);
     };
-    try wl.registry.bind(writer, ids.get(.registry), shm_name, wl.shm.name, wl.shm.version, ids.new(.shm));
+    try wl.registry.bind(writer, ids.get(.registry), shm_global.name, wl.shm.name, @min(wl.shm.version, shm_global.version), ids.new(&id_pool, .shm));
 
-    const layer_shell_name = maybe_layer_shell_name orelse {
+    const layer_shell_global = maybe_layer_shell orelse {
         std.log.err("no zwlr_layer_shell_v1 — compositor does not support wlr-layer-shell", .{});
         std.process.exit(0xff);
     };
-    try wl.registry.bind(writer, ids.get(.registry), layer_shell_name, wl.layer_shell.name, wl.layer_shell.version, ids.new(.layer_shell));
+    try wl.registry.bind(writer, ids.get(.registry), layer_shell_global.name, wl.layer_shell.name, @min(wl.layer_shell.version, layer_shell_global.version), ids.new(&id_pool, .layer_shell));
 
     // Create surface
-    try wl.compositor.create_surface(writer, ids.get(.compositor), ids.new(.surface));
+    try wl.compositor.create_surface(writer, ids.get(.compositor), ids.new(&id_pool, .surface));
 
     // Create layer surface in overlay layer
     try wl.layer_shell.get_layer_surface(
         writer,
         ids.get(.layer_shell),
-        ids.new(.layer_surface),
+        ids.new(&id_pool, .layer_surface),
         ids.get(.surface),
         null, // output: compositor picks
         .overlay,
@@ -139,9 +150,10 @@ fn go(
     try wl.layer_surface.set_keyboard_interactivity(writer, ids.get(.layer_surface), .none);
 
     // Create empty region for input passthrough
-    try wl.compositor.create_region(writer, ids.get(.compositor), ids.new(.wl_region));
+    try wl.compositor.create_region(writer, ids.get(.compositor), ids.new(&id_pool, .wl_region));
     try wl.surface.set_input_region(writer, ids.get(.surface), ids.get(.wl_region));
     try wl.region.destroy(writer, ids.get(.wl_region));
+    ids.destroy(.wl_region);
 
     // Set opaque region to null (fully transparent)
     try wl.surface.set_opaque_region(writer, ids.get(.surface), null);
@@ -155,10 +167,15 @@ fn go(
     var height: u32 = 0;
     while (width == 0 or height == 0) {
         const sender, const opcode, const size = try wl.readHeader(reader);
-        switch (ids.lookup(sender)) {
-            .display => try handleDisplayEvent(reader, opcode),
+        const result = ids.lookup(sender);
+        if (result.dying) {
+            const body = size -| 8;
+            if (body > 0) try reader.discardAll(body);
+            continue;
+        }
+        switch (result.kind) {
+            .display => try handleDisplayEvent(&id_pool, &ids, reader, opcode),
             .shm => {
-                // shm format event — just consume it
                 if (opcode == wl.shm.event.format) {
                     _ = try reader.takeInt(u32, wl.native_endian);
                 } else {
@@ -180,9 +197,8 @@ fn go(
                 else => std.debug.panic("unhandled layer_surface event opcode={}", .{opcode}),
             },
             else => {
-                // Skip unknown events
-                const payload_size = size - 8;
-                try reader.discardAll(payload_size);
+                const body = size -| 8;
+                if (body > 0) try reader.discardAll(body);
             },
         }
     }
@@ -191,8 +207,7 @@ fn go(
     const stride: u32 = width * 4;
     const shm_size: u32 = stride * height;
 
-    const shm_memfd_name = "overlay-shm";
-    const shm_fd = std.posix.memfd_createZ(shm_memfd_name, 0) catch |e| {
+    const shm_fd = std.posix.memfd_createZ("overlay-shm", 0) catch |e| {
         std.log.err("memfd_create failed: {s}", .{@errorName(e)});
         std.process.exit(0xff);
     };
@@ -207,22 +222,14 @@ fn go(
     const pixel_data: [*]u32 = @ptrCast(@alignCast(pixels.ptr));
 
     try writer.flush();
-    wl.shm.create_pool(stream, ids.get(.shm), ids.new(.shm_pool), shm_fd, shm_size) catch |e| {
+    wl.shm.create_pool(stream, ids.get(.shm), ids.new(&id_pool, .shm_pool), shm_fd, shm_size) catch |e| {
         std.log.err("create_pool failed: {s}", .{@errorName(e)});
         std.process.exit(0xff);
     };
 
-    try wl.shm_pool.create_buffer(
-        writer,
-        ids.get(.shm_pool),
-        ids.new(.buffer),
-        0,
-        @intCast(width),
-        @intCast(height),
-        @intCast(stride),
-        .argb8888,
-    );
+    try wl.shm_pool.create_buffer(writer, ids.get(.shm_pool), ids.new(&id_pool, .buffer), 0, @intCast(width), @intCast(height), @intCast(stride), .argb8888);
     try wl.shm_pool.destroy(writer, ids.get(.shm_pool));
+    ids.destroy(.shm_pool);
 
     // Animation loop
     var frame_count: u32 = 0;
@@ -233,16 +240,13 @@ fn go(
             pixel_data[i] = 0x00000000;
         }
 
-        // Draw a spinning line from center
         drawSpinningLine(pixel_data, width, height, frame_count);
-
-        // Draw a pulsing circle
         drawPulsingCircle(pixel_data, width, height, frame_count);
 
-        // Attach, damage, request frame, commit
         try wl.surface.attach(writer, ids.get(.surface), ids.get(.buffer), 0, 0);
         try wl.surface.damage_buffer(writer, ids.get(.surface), 0, 0, @intCast(width), @intCast(height));
-        try wl.surface.frame(writer, ids.get(.surface), ids.get(.frame_callback));
+
+        try wl.surface.frame(writer, ids.get(.surface), ids.new(&id_pool, .frame_callback));
         try wl.surface.commit(writer, ids.get(.surface));
         try writer.flush();
 
@@ -250,8 +254,14 @@ fn go(
         var got_frame = false;
         while (!got_frame) {
             const sender, const opcode, const size = try wl.readHeader(reader);
-            switch (ids.lookup(sender)) {
-                .display => try handleDisplayEvent(reader, opcode),
+            const result = ids.lookup(sender);
+            if (result.dying) {
+                const body = size -| 8;
+                if (body > 0) try reader.discardAll(body);
+                continue;
+            }
+            switch (result.kind) {
+                .display => try handleDisplayEvent(&id_pool, &ids, reader, opcode),
                 .shm => {
                     if (opcode == wl.shm.event.format) {
                         _ = try reader.takeInt(u32, wl.native_endian);
@@ -259,18 +269,17 @@ fn go(
                         std.debug.panic("unhandled shm event opcode={}", .{opcode});
                     }
                 },
-                .frame_callback => switch (opcode) {
-                    wl.callback.event.done => {
-                        _ = try reader.takeInt(u32, wl.native_endian); // timestamp
-                        got_frame = true;
-                    },
-                    else => @panic("unhandled frame callback event"),
+                .frame_callback => {
+                    const timestamp = try reader.takeInt(u32, wl.native_endian);
+                    _ = timestamp;
+                    ids.remove(.frame_callback);
+                    got_frame = true;
                 },
                 .layer_surface => switch (opcode) {
                     wl.layer_surface.event.configure => {
                         const serial = try reader.takeInt(u32, wl.native_endian);
-                        _ = try reader.takeInt(u32, wl.native_endian); // new width
-                        _ = try reader.takeInt(u32, wl.native_endian); // new height
+                        _ = try reader.takeInt(u32, wl.native_endian);
+                        _ = try reader.takeInt(u32, wl.native_endian);
                         try wl.layer_surface.ack_configure(writer, ids.get(.layer_surface), serial);
                     },
                     wl.layer_surface.event.closed => {
@@ -280,13 +289,11 @@ fn go(
                     else => std.debug.panic("unhandled layer_surface event opcode={}", .{opcode}),
                 },
                 .buffer => {
-                    // wl_buffer.release — ignore
-                    const payload_size = size - 8;
-                    try reader.discardAll(payload_size);
+                    // wl_buffer.release — nothing to do
                 },
                 else => {
-                    const payload_size = size - 8;
-                    try reader.discardAll(payload_size);
+                    const body = size -| 8;
+                    if (body > 0) try reader.discardAll(body);
                 },
             }
         }
@@ -296,6 +303,8 @@ fn go(
 }
 
 fn handleDisplayEvent(
+    id_pool: *wl.IdPool,
+    ids: *Ids,
     reader: *wl.Reader,
     opcode: u16,
 ) error{ ReadFailed, EndOfStream, WaylandProtocol }!void {
@@ -313,7 +322,8 @@ fn handleDisplayEvent(
             return error.WaylandProtocol;
         },
         wl.display.event.delete_id => {
-            _ = try reader.takeInt(u32, wl.native_endian);
+            const deleted_id: wl.object = @enumFromInt(try reader.takeInt(u32, wl.native_endian));
+            ids.delete(id_pool, deleted_id);
         },
         else => std.debug.panic("unhandled display event opcode={}", .{opcode}),
     }
@@ -328,7 +338,6 @@ fn drawSpinningLine(pixel_data: [*]u32, width: u32, height: u32, frame: u32) voi
     const ex: f32 = cx + radius * @cos(angle);
     const ey: f32 = cy + radius * @sin(angle);
 
-    // Bresenham-style line from (cx, cy) to (ex, ey)
     const steps: u32 = @intFromFloat(radius * 2.0);
     for (0..steps) |i| {
         const t: f32 = @as(f32, @floatFromInt(i)) / @as(f32, @floatFromInt(steps));
@@ -337,13 +346,12 @@ fn drawSpinningLine(pixel_data: [*]u32, width: u32, height: u32, frame: u32) voi
         if (px >= 0 and py >= 0 and px < @as(i32, @intCast(width)) and py < @as(i32, @intCast(height))) {
             const ux: u32 = @intCast(px);
             const uy: u32 = @intCast(py);
-            // Draw a 3px thick line
             for (0..3) |dy| {
                 for (0..3) |dx| {
                     const fx: u32 = ux +| @as(u32, @intCast(dx)) -| 1;
                     const fy: u32 = uy +| @as(u32, @intCast(dy)) -| 1;
                     if (fx < width and fy < height) {
-                        pixel_data[fy * width + fx] = 0xFFFF0000; // red
+                        pixel_data[fy * width + fx] = 0xFFFF0000;
                     }
                 }
             }
@@ -371,7 +379,7 @@ fn drawPulsingCircle(pixel_data: [*]u32, width: u32, height: u32, frame: u32) vo
             const dx: f32 = @as(f32, @floatFromInt(x)) - cx;
             const dist_sq: f32 = dx * dx + dy * dy;
             if (dist_sq <= r_sq and dist_sq >= inner_r_sq) {
-                pixel_data[y * width + x] = 0xCC00FF00; // semi-transparent green
+                pixel_data[y * width + x] = 0xCC00FF00;
             }
         }
     }

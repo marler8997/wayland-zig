@@ -1,3 +1,134 @@
+pub const IdMap = @import("IdMap.zig");
+
+/// An incrementing pool of ids with with recycle stack. Reuses IDs from the recycle stack when
+/// available, otherwise increments a counter. Drops IDs if the stack is full.
+pub const IdPool = struct {
+    next: u32,
+    recycle_stack: []object,
+    recycle_count: u32 = 0,
+
+    /// Allocates a new object ID.
+    pub fn new(self: *IdPool) object {
+        if (self.recycle_count > 0) {
+            self.recycle_count -= 1;
+            return self.recycle_stack[self.recycle_count];
+        }
+        const id = self.next;
+        self.next = id + 1;
+        return @enumFromInt(id);
+    }
+
+    /// Returns an ID for reuse, called when processing wl_display.delete_id.
+    pub fn delete(self: *IdPool, id: object) void {
+        if (self.recycle_count < self.recycle_stack.len) {
+            self.recycle_stack[self.recycle_count] = id;
+            self.recycle_count += 1;
+        }
+    }
+};
+
+pub const IdsObject = struct { @Type(.enum_literal), generated.Interface };
+pub fn Ids(comptime objects: []const IdsObject) type {
+    const capacity = objects.len;
+    const E = std.math.IntFittingRange(0, capacity);
+
+    // Build client_destroyable bitfield at comptime
+    var client_destroyable: [capacity]bool = undefined;
+    for (objects, 0..) |obj, i| {
+        client_destroyable[i] = obj[1].hasDestructor();
+    }
+    const client_destroyable_final = client_destroyable;
+
+    return struct {
+        inner: IdMap,
+        dying: std.StaticBitSet(capacity) = std.StaticBitSet(capacity).initEmpty(),
+
+        const Self = @This();
+
+        pub const Store = IdMap.Store(capacity);
+
+        pub const Kind = blk: {
+            var fields: [capacity]std.builtin.Type.EnumField = undefined;
+            for (objects, 0..) |obj, i| {
+                fields[i] = .{ .name = @tagName(obj[0]), .value = i };
+            }
+            break :blk @Type(.{ .@"enum" = .{
+                .tag_type = E,
+                .fields = &fields,
+                .is_exhaustive = true,
+                .decls = &.{},
+            } });
+        };
+
+        pub const Lookup = struct {
+            kind: Kind,
+            /// Destructor has been sent for this object but delete_id has not been received yet.
+            dying: bool,
+        };
+
+        pub fn init(store: *Store) Self {
+            return .{ .inner = store.map() };
+        }
+
+        /// Allocates a new object ID and maps it to the given kind.
+        pub fn new(self: *Self, id_pool: *IdPool, kind: Kind) object {
+            const id = id_pool.new();
+            self.inner.put(@intFromEnum(id), @intFromEnum(kind));
+            return id;
+        }
+
+        /// Returns the object ID for the given kind (reverse array index).
+        pub fn getOpt(self: *const Self, kind: Kind) ?object {
+            const k = self.inner.getKey(@intFromEnum(kind)) orelse return null;
+            return @enumFromInt(k);
+        }
+
+        /// Returns the object ID for the given kind, panics if not mapped.
+        pub fn get(self: *const Self, kind: Kind) object {
+            return self.getOpt(kind) orelse
+                std.debug.panic("Ids: no object for {s}", .{@tagName(kind)});
+        }
+
+        /// Looks up the kind for an object ID (hash map lookup). Panics if not found.
+        pub fn lookup(self: *const Self, key: object) Lookup {
+            const v = self.inner.get(@intFromEnum(key)) orelse
+                std.debug.panic("Ids: unknown object {}", .{@intFromEnum(key)});
+            return .{ .kind = @enumFromInt(v), .dying = self.dying.isSet(v) };
+        }
+
+        /// Server-destroyed: remove from map immediately.
+        pub fn remove(self: *Self, comptime kind: Kind) void {
+            const idx = @intFromEnum(kind);
+            if (client_destroyable_final[idx])
+                @compileError("'" ++ @tagName(kind) ++ "' is client-destroyable, use destroy() not remove()");
+            const k = self.inner.getKey(idx) orelse
+                std.debug.panic("Ids: no object for {s}", .{@tagName(kind)});
+            std.debug.assert(self.inner.remove(k));
+        }
+
+        /// Client-destroyed: mark as dying, keep in map until delete_id.
+        pub fn destroy(self: *Self, comptime kind: Kind) void {
+            const idx = @intFromEnum(kind);
+            if (!client_destroyable_final[idx])
+                @compileError("'" ++ @tagName(kind) ++ "' is server-destroyable, use remove() not destroy()");
+            std.debug.assert(!self.dying.isSet(idx));
+            self.dying.set(idx);
+        }
+
+        /// Handle wl_display.delete_id: remove dying entry and recycle the ID.
+        pub fn delete(self: *Self, id_pool: *IdPool, key: object) void {
+            if (self.inner.get(@intFromEnum(key))) |v| {
+                // Still in map — must be dying (client-destroyed)
+                std.debug.assert(self.dying.isSet(v));
+                self.dying.unset(v);
+                std.debug.assert(self.inner.remove(@intFromEnum(key)));
+            }
+            // If not in map, was server-destroyed — already removed
+            id_pool.delete(key);
+        }
+    };
+}
+
 pub const Writer = std.Io.Writer;
 pub const Reader = std.Io.Reader;
 
@@ -294,59 +425,6 @@ pub fn Pad(align_to: comptime_int) type {
 }
 fn padLen(comptime align_to: comptime_int, len: Pad(align_to)) Pad(align_to) {
     return (0 -% len) & (align_to - 1);
-}
-
-/// Tracks a statically-known set of object IDs.
-pub fn IdTable(comptime IdEnum: type) type {
-    const enum_info = switch (@typeInfo(IdEnum)) {
-        .@"enum" => |i| i,
-        else => |i| @compileError("IdTable requires an enum type but got " ++ @tagName(i)),
-    };
-    if (!@hasField(IdEnum, "display")) @compileError("the enum given to IdTable must have a field named 'display'");
-
-    for (std.meta.fields(IdEnum), 0..) |field, i| {
-        std.debug.assert(field.value == i);
-    }
-
-    const capacity = enum_info.fields.len;
-    const ObjId = std.math.IntFittingRange(0, capacity);
-    const Count = std.math.IntFittingRange(0, capacity);
-
-    const count_before_display = @intFromEnum(IdEnum.display);
-    const count_after_display = capacity - 1 - @intFromEnum(IdEnum.display);
-
-    return struct {
-        enum_to_obj: [capacity]ObjId = ([1]ObjId{0} ** count_before_display) ++
-            [1]ObjId{1} ++
-            ([1]ObjId{0} ** count_after_display),
-        obj_to_enum: [capacity]IdEnum = [1]IdEnum{.display} ++ ([1]IdEnum{undefined} ** (capacity - 1)),
-        last_id: Count = 1,
-
-        const Self = @This();
-
-        pub fn new(table: *Self, id: IdEnum) object {
-            std.debug.assert(table.enum_to_obj[@intFromEnum(id)] == 0);
-            const obj_id = table.last_id + 1;
-            std.debug.assert(obj_id <= capacity);
-
-            table.enum_to_obj[@intFromEnum(id)] = obj_id;
-            table.obj_to_enum[obj_id - 1] = id;
-            table.last_id = obj_id;
-            return @enumFromInt(obj_id);
-        }
-
-        pub fn get(table: *const Self, id: IdEnum) object {
-            const obj_id = table.enum_to_obj[@intFromEnum(id)];
-            std.debug.assert(obj_id != 0);
-            return @enumFromInt(obj_id);
-        }
-
-        pub fn lookup(table: *const Self, o: object) IdEnum {
-            const raw = @intFromEnum(o);
-            std.debug.assert(raw >= 1 and raw <= table.last_id);
-            return table.obj_to_enum[raw - 1];
-        }
-    };
 }
 
 pub const zig_atleast_15 = @import("builtin").zig_version.order(.{ .major = 0, .minor = 15, .patch = 0 }) != .lt;

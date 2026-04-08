@@ -256,6 +256,31 @@ fn generate(w: *std.Io.Writer, interfaces: []const Interface) error{WriteFailed}
     for (interfaces) |iface| {
         try generateInterface(w, iface, interfaces);
     }
+
+    // Generate Interface enum with hasDestructor
+    try w.writeAll("pub const Interface = enum {\n");
+    for (interfaces) |iface| {
+        try w.print("    {f},\n", .{fmtId(iface.name)});
+    }
+    try w.writeAll(
+        \\
+        \\    pub fn hasDestructor(self: Interface) bool {
+        \\        return switch (self) {
+        \\
+    );
+    for (interfaces) |iface| {
+        const has_destructor = for (iface.requests) |req| {
+            if (req.is_destructor) break true;
+        } else false;
+        try w.print("            .{f} => {},\n", .{ fmtId(iface.name), has_destructor });
+    }
+    try w.writeAll(
+        \\        };
+        \\    }
+        \\};
+        \\
+    );
+
     try w.writeAll(
         \\pub const std = @import("std");
         \\pub const native_endian = @import("builtin").cpu.arch.endian();
@@ -307,6 +332,10 @@ fn generateInterface(w: *std.Io.Writer, iface: Interface, all_interfaces: []cons
     try emitDocComment(w, iface.description, "");
     try w.print("pub const {f} = struct {{\n", .{fmtId(name)});
     try w.print("    pub const name = \"{s}\";\n", .{iface.name});
+    const has_destructor = for (iface.requests) |req| {
+        if (req.is_destructor) break true;
+    } else false;
+    try w.print("    pub const has_destructor = {};\n", .{has_destructor});
     if (iface.version == 1) {
         try w.writeAll("    /// This field only exists while the interface is at v1.\n");
         try w.writeAll("    /// Reference it to induce compile errors when the version changes.\n");
