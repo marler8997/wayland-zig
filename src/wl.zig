@@ -1,3 +1,239 @@
+pub const IdMap = @import("IdMap.zig");
+
+/// An incrementing pool of ids with with recycle stack. Reuses IDs from the recycle stack when
+/// available, otherwise increments a counter. Drops IDs if the stack is full.
+pub const IdPool = struct {
+    next: u32,
+    recycle_stack: []object,
+    recycle_count: u32 = 0,
+
+    /// Allocates a new object ID.
+    pub fn new(self: *IdPool) object {
+        if (self.recycle_count > 0) {
+            self.recycle_count -= 1;
+            return self.recycle_stack[self.recycle_count];
+        }
+        const id = self.next;
+        self.next = id + 1;
+        return @enumFromInt(id);
+    }
+
+    /// Returns an ID for reuse, called when processing wl_display.delete_id.
+    pub fn delete(self: *IdPool, id: object) void {
+        if (self.recycle_count < self.recycle_stack.len) {
+            self.recycle_stack[self.recycle_count] = id;
+            self.recycle_count += 1;
+        }
+    }
+};
+
+/// Optional zombie ID tracking. If enabled, lookup() can distinguish
+/// "zombie" (recently destroyed, expected) from "truly unknown" (API misuse).
+/// If the zombie map ever fails to allocate, tracking is disabled
+/// connection-wide and the oom_handler fires once. Subsequent destructor
+/// calls behave as if zombie tracking was never enabled.
+pub const Zombies = struct {
+    allocator: std.mem.Allocator,
+    map: std.AutoHashMapUnmanaged(object, void) = .empty,
+    oom_handler: *const fn () void = &defaultOomHandler,
+
+    /// Returns true if tracked, false if OOM (caller should disable tracking).
+    fn put(self: *Zombies, id: object) bool {
+        self.map.put(self.allocator, id, {}) catch return false;
+        return true;
+    }
+
+    pub fn contains(self: *const Zombies, id: object) bool {
+        return self.map.contains(id);
+    }
+
+    fn remove(self: *Zombies, id: object) void {
+        _ = self.map.remove(id);
+    }
+
+    fn defaultOomHandler() void {
+        std.debug.panic("zombie tracking allocation failed (out of memory)", .{});
+    }
+};
+
+// NOTE: we use a string instead of enum literal because strings can be
+//       constructed at comptime.
+pub const Object = struct { [:0]const u8, Interface };
+
+/// A bound instance of wayland objects. Tracks object IDs and provides
+/// type-safe write() that automatically injects writer and object ID.
+pub fn Instance(comptime objects: []const Object) type {
+    const capacity = objects.len;
+    const E = std.math.IntFittingRange(0, capacity);
+
+    return struct {
+        writer: *std.Io.Writer,
+        inner: IdMap,
+        id_pool: *IdPool,
+        maybe_zombies: ?Zombies,
+
+        const Self = @This();
+
+        pub const Store = IdMap.Store(capacity);
+
+        pub const Kind = blk: {
+            var fields: [capacity]std.builtin.Type.EnumField = undefined;
+            for (objects, 0..) |obj, i| {
+                fields[i] = .{ .name = obj[0], .value = i };
+            }
+            break :blk @Type(.{ .@"enum" = .{
+                .tag_type = E,
+                .fields = &fields,
+                .is_exhaustive = true,
+                .decls = &.{},
+            } });
+        };
+
+        pub const ServerKind = blk: {
+            var fields: [capacity]std.builtin.Type.EnumField = undefined;
+            var count: usize = 0;
+            for (objects, 0..) |obj, i| {
+                if (!obj[1].hasDestructor()) {
+                    fields[count] = .{ .name = obj[0], .value = i };
+                    count += 1;
+                }
+            }
+            break :blk @Type(.{ .@"enum" = .{
+                .tag_type = E,
+                .fields = fields[0..count],
+                .is_exhaustive = false,
+                .decls = &.{},
+            } });
+        };
+
+        pub fn init(writer: *std.Io.Writer, store: *Store, id_pool: *IdPool, opt: struct {
+            /// Optional sanity checking. Due to the nature of IDs on wayland, it
+            /// required unbounded growth so, it takes an allocator. If your app has no
+            /// bugs around
+            /// id lifetimes then you don't need this.
+            zombies: ?Zombies = null,
+        }) Self {
+            return .{
+                .writer = writer,
+                .inner = store.map(),
+                .id_pool = id_pool,
+                .maybe_zombies = opt.zombies,
+            };
+        }
+
+        /// Allocates a new object ID and maps it to the given kind.
+        pub fn new(self: *Self, kind: Kind) object {
+            std.debug.assert(self.inner.getKey(@intFromEnum(kind)) == null);
+            const id = self.id_pool.new();
+            self.inner.put(@intFromEnum(id), @intFromEnum(kind));
+            return id;
+        }
+
+        /// Returns the object ID for the given kind (reverse array index).
+        pub fn getOpt(self: *const Self, kind: Kind) ?object {
+            const k = self.inner.getKey(@intFromEnum(kind)) orelse return null;
+            return @enumFromInt(k);
+        }
+
+        /// Returns the object ID for the given kind, panics if not mapped.
+        pub fn get(self: *const Self, kind: Kind) object {
+            return self.getOpt(kind) orelse
+                std.debug.panic("Instance: no object for {s}", .{@tagName(kind)});
+        }
+
+        /// Looks up the kind for an object ID (hash map lookup).
+        /// Returns null for zombie IDs (destroyed but delete_id not yet received).
+        /// If zombie tracking is enabled, panics on truly unknown IDs (API misuse).
+        pub fn lookup(self: *const Self, key: object) ?Kind {
+            const v = self.inner.get(@intFromEnum(key)) orelse {
+                if (self.maybe_zombies) |*zombies| {
+                    if (zombies.contains(key)) return null;
+                    std.debug.panic("Instance: unknown object {} (not live and not zombie)", .{@intFromEnum(key)});
+                }
+                return null;
+            };
+            return @enumFromInt(v);
+        }
+
+        /// Remove a server-destroyed object from the map. No zombie tracking
+        /// needed since the server initiated the destruction.
+        pub fn remove(self: *Self, kind: ServerKind) void {
+            const idx = @intFromEnum(kind);
+            const k = self.inner.getKey(idx) orelse
+                std.debug.panic("Instance: no object for {s}", .{@tagName(kind)});
+            std.debug.assert(self.inner.remove(k));
+        }
+
+        /// Abandon a live object that has no destructor request. Removes it
+        /// from the map and adds it to zombie tracking so that late events
+        /// are silently discarded instead of panicking.
+        pub fn abandon(self: *Self, kind: ServerKind) void {
+            const idx = @intFromEnum(kind);
+            const k = self.inner.getKey(idx) orelse
+                std.debug.panic("Instance: no object for {s}", .{@tagName(kind)});
+            std.debug.assert(self.inner.remove(k));
+            if (self.maybe_zombies) |*zombies| {
+                if (!zombies.put(@enumFromInt(k))) {
+                    zombies.oom_handler();
+                    zombies.map.deinit(zombies.allocator);
+                    self.maybe_zombies = null;
+                }
+            }
+        }
+
+        /// Handle wl_display.delete_id - recycle the ID and remove from
+        /// zombie tracking if present.
+        pub fn delete(self: *Self, key: object) void {
+            // ID must already be out of the map (removed by remove() or write(destructor))
+            std.debug.assert(self.inner.get(@intFromEnum(key)) == null);
+            if (self.maybe_zombies) |*zombies| {
+                zombies.remove(key);
+            }
+            self.id_pool.delete(key);
+        }
+
+        /// Send a request on a bound object. Writer and object ID are
+        /// automatically prepended. If the method is a destructor, the
+        /// object is automatically removed from the map and tracked as
+        /// a zombie (if zombies is set).
+        pub fn write(
+            self: *Self,
+            comptime kind: Kind,
+            comptime method: InterfaceType(kind).Method,
+            args: @field(InterfaceType(kind), @tagName(method) ++ "_params"),
+        ) @typeInfo(@TypeOf(@field(InterfaceType(kind), @tagName(method)))).@"fn".return_type.? {
+            const func = @field(InterfaceType(kind), @tagName(method));
+            const id = self.get(kind);
+            const FullArgs = std.meta.ArgsTuple(@TypeOf(func));
+            var full_args: FullArgs = undefined;
+            full_args[0] = self.writer;
+            full_args[1] = id;
+            inline for (2..@typeInfo(FullArgs).@"struct".fields.len) |i| {
+                full_args[i] = args[i - 2];
+            }
+            const result = @call(.auto, func, full_args);
+            if (method.isDestructor()) {
+                const k = self.inner.getKey(@intFromEnum(kind)) orelse unreachable;
+                std.debug.assert(self.inner.remove(k));
+                if (self.maybe_zombies) |*zombies| {
+                    if (!zombies.put(id)) {
+                        zombies.oom_handler();
+                        // Disable zombie tracking. If we miss a zombie ID,
+                        // lookup() would incorrectly panic thinking it's API misuse.
+                        zombies.map.deinit(zombies.allocator);
+                        self.maybe_zombies = null;
+                    }
+                }
+            }
+            return result;
+        }
+
+        fn InterfaceType(comptime kind: Kind) type {
+            return objects[@intFromEnum(kind)][1].Type();
+        }
+    };
+}
+
 pub const Writer = std.Io.Writer;
 pub const Reader = std.Io.Reader;
 
@@ -84,7 +320,7 @@ pub fn getSockaddr(out_err: *SockaddrError) error{Sockaddr}!Sockaddr {
             if (std.fs.path.isAbsolute(wayland_display)) {
                 @memcpy(&result.unix.path, wayland_display);
                 result.unix.path[wayland_display.len] = 0;
-                result.len = @intCast(wayland_display.len);
+                result.len = @intCast(unix_sockaddr_path_offset + wayland_display.len);
                 return result;
             }
             break :blk wayland_display;
@@ -135,6 +371,7 @@ pub fn readHeader(reader: *Reader) error{ ReadFailed, EndOfStream }!struct { obj
     return .{ sender, second.opcode, second.size };
 }
 
+pub const Interface = generated.Interface;
 pub const SizeOpcode = generated.SizeOpcode;
 pub const object = generated.object;
 pub const Fixed = generated.Fixed;
@@ -294,59 +531,6 @@ pub fn Pad(align_to: comptime_int) type {
 }
 fn padLen(comptime align_to: comptime_int, len: Pad(align_to)) Pad(align_to) {
     return (0 -% len) & (align_to - 1);
-}
-
-/// Tracks a statically-known set of object IDs.
-pub fn IdTable(comptime IdEnum: type) type {
-    const enum_info = switch (@typeInfo(IdEnum)) {
-        .@"enum" => |i| i,
-        else => |i| @compileError("IdTable requires an enum type but got " ++ @tagName(i)),
-    };
-    if (!@hasField(IdEnum, "display")) @compileError("the enum given to IdTable must have a field named 'display'");
-
-    for (std.meta.fields(IdEnum), 0..) |field, i| {
-        std.debug.assert(field.value == i);
-    }
-
-    const capacity = enum_info.fields.len;
-    const ObjId = std.math.IntFittingRange(0, capacity);
-    const Count = std.math.IntFittingRange(0, capacity);
-
-    const count_before_display = @intFromEnum(IdEnum.display);
-    const count_after_display = capacity - 1 - @intFromEnum(IdEnum.display);
-
-    return struct {
-        enum_to_obj: [capacity]ObjId = ([1]ObjId{0} ** count_before_display) ++
-            [1]ObjId{1} ++
-            ([1]ObjId{0} ** count_after_display),
-        obj_to_enum: [capacity]IdEnum = [1]IdEnum{.display} ++ ([1]IdEnum{undefined} ** (capacity - 1)),
-        last_id: Count = 1,
-
-        const Self = @This();
-
-        pub fn new(table: *Self, id: IdEnum) object {
-            std.debug.assert(table.enum_to_obj[@intFromEnum(id)] == 0);
-            const obj_id = table.last_id + 1;
-            std.debug.assert(obj_id <= capacity);
-
-            table.enum_to_obj[@intFromEnum(id)] = obj_id;
-            table.obj_to_enum[obj_id - 1] = id;
-            table.last_id = obj_id;
-            return @enumFromInt(obj_id);
-        }
-
-        pub fn get(table: *const Self, id: IdEnum) object {
-            const obj_id = table.enum_to_obj[@intFromEnum(id)];
-            std.debug.assert(obj_id != 0);
-            return @enumFromInt(obj_id);
-        }
-
-        pub fn lookup(table: *const Self, o: object) IdEnum {
-            const raw = @intFromEnum(o);
-            std.debug.assert(raw >= 1 and raw <= table.last_id);
-            return table.obj_to_enum[raw - 1];
-        }
-    };
 }
 
 pub const zig_atleast_15 = @import("builtin").zig_version.order(.{ .major = 0, .minor = 15, .patch = 0 }) != .lt;

@@ -256,6 +256,42 @@ fn generate(w: *std.Io.Writer, interfaces: []const Interface) error{WriteFailed}
     for (interfaces) |iface| {
         try generateInterface(w, iface, interfaces);
     }
+
+    // Generate Interface enum with hasDestructor
+    try w.writeAll("pub const Interface = enum {\n");
+    for (interfaces) |iface| {
+        try w.print("    {f},\n", .{fmtId(iface.name)});
+    }
+    try w.writeAll(
+        \\
+        \\    pub fn hasDestructor(self: Interface) bool {
+        \\        return switch (self) {
+        \\
+    );
+    for (interfaces) |iface| {
+        const has_destructor = for (iface.requests) |req| {
+            if (req.is_destructor) break true;
+        } else false;
+        try w.print("            .{f} => {},\n", .{ fmtId(iface.name), has_destructor });
+    }
+    try w.writeAll(
+        \\        };
+        \\    }
+        \\
+        \\    pub fn Type(comptime self: Interface) type {
+        \\        return switch (self) {
+        \\
+    );
+    for (interfaces) |iface| {
+        try w.print("            .{f} => {f},\n", .{ fmtId(iface.name), fmtId(stripWlPrefix(iface.name)) });
+    }
+    try w.writeAll(
+        \\        };
+        \\    }
+        \\};
+        \\
+    );
+
     try w.writeAll(
         \\pub const std = @import("std");
         \\pub const native_endian = @import("builtin").cpu.arch.endian();
@@ -307,6 +343,10 @@ fn generateInterface(w: *std.Io.Writer, iface: Interface, all_interfaces: []cons
     try emitDocComment(w, iface.description, "");
     try w.print("pub const {f} = struct {{\n", .{fmtId(name)});
     try w.print("    pub const name = \"{s}\";\n", .{iface.name});
+    const has_destructor = for (iface.requests) |req| {
+        if (req.is_destructor) break true;
+    } else false;
+    try w.print("    pub const has_destructor = {};\n", .{has_destructor});
     if (iface.version == 1) {
         try w.writeAll("    /// This field only exists while the interface is at v1.\n");
         try w.writeAll("    /// Reference it to induce compile errors when the version changes.\n");
@@ -327,6 +367,21 @@ fn generateInterface(w: *std.Io.Writer, iface: Interface, all_interfaces: []cons
         for (iface.events, 0..) |ev, i| {
             try w.print("        pub const {f} = {};\n", .{ fmtId(ev.name), i });
         }
+        try w.writeAll("    };\n");
+    }
+    // Generate Method enum
+    if (iface.requests.len > 0) {
+        try w.writeAll("    pub const Method = enum {\n");
+        for (iface.requests) |req| {
+            try w.print("        {f},\n", .{fmtId(req.name)});
+        }
+        try w.writeAll("\n        pub fn isDestructor(self: Method) bool {\n");
+        try w.writeAll("            return switch (self) {\n");
+        for (iface.requests) |req| {
+            try w.print("                .{f} => {},\n", .{ fmtId(req.name), req.is_destructor });
+        }
+        try w.writeAll("            };\n");
+        try w.writeAll("        }\n");
         try w.writeAll("    };\n");
     }
     for (iface.requests, 0..) |req, opcode| {
@@ -399,11 +454,14 @@ fn declCollision(name: []const u8, enums: []const Enum) bool {
 fn generateRequest(w: *std.Io.Writer, iface_name: []const u8, req: Message, opcode: u16, iface: Interface, all_interfaces: []const Interface) error{WriteFailed}!void {
     if (hasFdArg(req)) {
         try w.print("    // {s}: fd-passing request, see manual implementation\n", .{req.name});
+        try emitParams(w, req, iface, all_interfaces);
         return;
     }
 
     if (hasUntypedNewId(req)) {
-        return generateUntypedNewIdRequest(w, iface_name, req, opcode, iface, all_interfaces);
+        try generateUntypedNewIdRequest(w, iface_name, req, opcode, iface, all_interfaces);
+        try emitParams(w, req, iface, all_interfaces);
+        return;
     }
 
     var has_dynamic = false;
@@ -414,8 +472,6 @@ fn generateRequest(w: *std.Io.Writer, iface_name: []const u8, req: Message, opco
         }
     }
 
-    const is_display = std.mem.eql(u8, iface.name, "wl_display");
-
     // Doc comment
     try emitDocComment(w, req.description, "    ");
     if (req.is_destructor) {
@@ -424,10 +480,7 @@ fn generateRequest(w: *std.Io.Writer, iface_name: []const u8, req: Message, opco
     }
 
     // Signature
-    try w.print("    pub fn {f}(writer: *std.Io.Writer", .{fmtId(req.name)});
-    if (!is_display) {
-        try w.print(", {f}_id: object", .{fmtId(iface_name)});
-    }
+    try w.print("    pub fn {f}(writer: *std.Io.Writer, {f}_id: object", .{ fmtId(req.name), fmtId(iface_name) });
     for (req.args) |arg| {
         try w.writeAll(", ");
         try writeArgParam(w, arg, iface.enums);
@@ -443,18 +496,34 @@ fn generateRequest(w: *std.Io.Writer, iface_name: []const u8, req: Message, opco
     }
 
     try w.writeAll("    }\n");
+    try emitParams(w, req, iface, all_interfaces);
+}
+
+fn emitParams(w: *std.Io.Writer, req: Message, iface: Interface, all_interfaces: []const Interface) error{WriteFailed}!void {
+    try w.print("    pub const {f}_params = struct {{", .{fmtId(req.name)});
+    var first = true;
+    for (req.args) |arg| {
+        if (arg.arg_type == .new_id and arg.interface == null) {
+            // Untyped new_id expands to: interface string, version, id
+            if (!first) try w.writeAll(",");
+            try w.writeAll(" []const u8, u32, object");
+            first = false;
+        } else {
+            if (!first) try w.writeAll(",");
+            try w.writeAll(" ");
+            try writeArgType(w, arg, iface, all_interfaces);
+            first = false;
+        }
+    }
+    if (!first) try w.writeAll(" ");
+    try w.writeAll("};\n");
 }
 
 fn emitStaticBody(w: *std.Io.Writer, iface_name: []const u8, req: Message, opcode: u16, iface: Interface, all_interfaces: []const Interface) error{WriteFailed}!void {
-    const is_display = std.mem.eql(u8, iface.name, "wl_display");
     var size: u32 = 8;
     for (req.args) |arg| size += argFixedSize(arg);
     try w.print("        const msg_len: u16 = {};\n", .{size});
-    if (is_display) {
-        try w.writeAll("        try writer.writeInt(u32, @intFromEnum(object.display), native_endian);\n");
-    } else {
-        try w.print("        try writer.writeInt(u32, @intFromEnum({f}_id), native_endian);\n", .{fmtId(iface_name)});
-    }
+    try w.print("        try writer.writeInt(u32, @intFromEnum({f}_id), native_endian);\n", .{fmtId(iface_name)});
     try w.print("        try writer.writeInt(u32, @bitCast(SizeOpcode{{ .size = msg_len, .opcode = {} }}), native_endian);\n", .{opcode});
     for (req.args) |arg| try emitSerialize(w, arg, iface, all_interfaces);
 }
@@ -531,12 +600,8 @@ fn generateUntypedNewIdRequest(
     iface: Interface,
     all_interfaces: []const Interface,
 ) error{WriteFailed}!void {
-    const is_display = std.mem.eql(u8, iface.name, "wl_display");
     try emitDocComment(w, req.description, "    ");
-    try w.print("    pub fn {f}(writer: *std.Io.Writer", .{fmtId(req.name)});
-    if (!is_display) {
-        try w.print(", {f}_id: object", .{fmtId(iface_name)});
-    }
+    try w.print("    pub fn {f}(writer: *std.Io.Writer, {f}_id: object", .{ fmtId(req.name), fmtId(iface_name) });
     for (req.args) |arg| {
         if (arg.arg_type == .new_id and arg.interface == null) {
             try w.writeAll(", interface: []const u8, version: u32, id: object");
@@ -565,11 +630,7 @@ fn generateUntypedNewIdRequest(
     }
     try w.writeAll(";\n");
 
-    if (is_display) {
-        try w.writeAll("        try writer.writeInt(u32, @intFromEnum(object.display), native_endian);\n");
-    } else {
-        try w.print("        try writer.writeInt(u32, @intFromEnum({f}_id), native_endian);\n", .{fmtId(iface_name)});
-    }
+    try w.print("        try writer.writeInt(u32, @intFromEnum({f}_id), native_endian);\n", .{fmtId(iface_name)});
     try w.print("        try writer.writeInt(u32, @bitCast(SizeOpcode{{ .size = msg_len, .opcode = {} }}), native_endian);\n", .{opcode});
 
     for (req.args) |arg| {

@@ -89,4 +89,14 @@ pub fn build(b: *std.Build) void {
         const run = b.addRunArtifact(unit_tests);
         test_non_interactive.dependOn(&run.step);
     }
+    {
+        const unit_tests = b.addTest(.{
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("src/IdMap.zig"),
+                .target = target,
+            }),
+        });
+        const run = b.addRunArtifact(unit_tests);
+        test_non_interactive.dependOn(&run.step);
+    }
 }
