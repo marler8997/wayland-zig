@@ -1,9 +1,8 @@
-pub fn main() !void {
-    var arena_state = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
+pub fn main(init: std.process.Init) !void {
+    const io = init.io;
+    const arena = init.arena.allocator();
 
-    var args = std.process.args();
+    var args = init.minimal.args.iterate();
     _ = args.next(); // skip program name
 
     var xml_paths: std.ArrayListUnmanaged([]const u8) = .empty;
@@ -20,7 +19,7 @@ pub fn main() !void {
     var interfaces: std.ArrayListUnmanaged(Interface) = .empty;
     for (xml_paths.items) |xml_path| {
         const _1_GB = 1 * 1024 * 1024 * 1024;
-        const data = std.fs.cwd().readFileAlloc(arena, xml_path, _1_GB) catch |err|
+        const data = std.Io.Dir.cwd().readFileAlloc(io, xml_path, arena, .limited(_1_GB)) catch |err|
             errExit("failed to read '{s}': {s}", .{ xml_path, @errorName(err) });
         var parser: xml.Parser = .{ .data = data };
         parseProtocol(&parser, arena, &interfaces) catch
@@ -28,13 +27,13 @@ pub fn main() !void {
     }
 
     const out_file = if (out_path) |p|
-        std.fs.cwd().createFile(p, .{}) catch |e|
+        std.Io.Dir.cwd().createFile(io, p, .{}) catch |e|
             errExit("failed to create output file '{s}': {s}", .{ p, @errorName(e) })
     else
-        std.fs.File.stdout();
+        std.Io.File.stdout();
 
     var write_buf: [8192]u8 = undefined;
-    var file_writer = out_file.writer(&write_buf);
+    var file_writer = out_file.writerStreaming(io, &write_buf);
     const writer = &file_writer.interface;
 
     generate(writer, interfaces.items) catch |err| switch (err) {
@@ -329,7 +328,7 @@ fn emitDocComment(w: *std.Io.Writer, desc: ?Description, indent: []const u8) err
 fn emitDocLines(w: *std.Io.Writer, text: []const u8, indent: []const u8) error{WriteFailed}!void {
     var lines = std.mem.splitScalar(u8, text, '\n');
     while (lines.next()) |line| {
-        const trimmed = std.mem.trimLeft(u8, line, " \t");
+        const trimmed = std.mem.trimStart(u8, line, " \t");
         if (trimmed.len == 0) {
             try w.print("{s}///\n", .{indent});
         } else {
@@ -523,7 +522,7 @@ fn emitStaticBody(w: *std.Io.Writer, iface_name: []const u8, req: Message, opcod
     var size: u32 = 8;
     for (req.args) |arg| size += argFixedSize(arg);
     try w.print("        const msg_len: u16 = {};\n", .{size});
-    try w.print("        try writer.writeInt(u32, @intFromEnum({f}_id), native_endian);\n", .{fmtId(iface_name)});
+    try w.print("        try writer.writeInt(u32, @backingInt({f}_id), native_endian);\n", .{fmtId(iface_name)});
     try w.print("        try writer.writeInt(u32, @bitCast(SizeOpcode{{ .size = msg_len, .opcode = {} }}), native_endian);\n", .{opcode});
     for (req.args) |arg| try emitSerialize(w, arg, iface, all_interfaces);
 }
@@ -583,9 +582,9 @@ fn emitDynamicBody(
     try w.writeAll(";\n");
 
     if (std.mem.eql(u8, iface.name, "wl_display")) {
-        try w.writeAll("        try writer.writeInt(u32, @intFromEnum(object.display), native_endian);\n");
+        try w.writeAll("        try writer.writeInt(u32, @backingInt(object.display), native_endian);\n");
     } else {
-        try w.print("        try writer.writeInt(u32, @intFromEnum({f}_id), native_endian);\n", .{fmtId(iface_name)});
+        try w.print("        try writer.writeInt(u32, @backingInt({f}_id), native_endian);\n", .{fmtId(iface_name)});
     }
     try w.print("        try writer.writeInt(u32, @bitCast(SizeOpcode{{ .size = msg_len, .opcode = {} }}), native_endian);\n", .{opcode});
 
@@ -630,7 +629,7 @@ fn generateUntypedNewIdRequest(
     }
     try w.writeAll(";\n");
 
-    try w.print("        try writer.writeInt(u32, @intFromEnum({f}_id), native_endian);\n", .{fmtId(iface_name)});
+    try w.print("        try writer.writeInt(u32, @backingInt({f}_id), native_endian);\n", .{fmtId(iface_name)});
     try w.print("        try writer.writeInt(u32, @bitCast(SizeOpcode{{ .size = msg_len, .opcode = {} }}), native_endian);\n", .{opcode});
 
     for (req.args) |arg| {
@@ -641,7 +640,7 @@ fn generateUntypedNewIdRequest(
                 \\        const padding = padded_str_len - @as(u32, @intCast(interface.len));
                 \\        try writer.writeAll(("\x00\x00\x00\x00")[0..padding]);
                 \\        try writer.writeInt(u32, version, native_endian);
-                \\        try writer.writeInt(u32, @intFromEnum(id), native_endian);
+                \\        try writer.writeInt(u32, @backingInt(id), native_endian);
                 \\
             );
         } else {
@@ -723,7 +722,7 @@ fn emitSerialize(
             try w.writeAll("        try writer.writeInt(i32, ");
             if (arg.enum_name) |enum_ref| {
                 if (!isEnumBitfield(enum_ref, iface, all_interfaces)) {
-                    try w.writeAll("@bitCast(@intFromEnum(");
+                    try w.writeAll("@bitCast(@backingInt(");
                     try writeArgParam(w, arg, enums);
                     try w.writeAll("))");
                 } else {
@@ -743,7 +742,7 @@ fn emitSerialize(
             try w.writeAll("        try writer.writeInt(u32, ");
             if (arg.enum_name) |enum_ref| {
                 if (!isEnumBitfield(enum_ref, iface, all_interfaces)) {
-                    try w.writeAll("@intFromEnum(");
+                    try w.writeAll("@backingInt(");
                     try writeArgParam(w, arg, enums);
                     try w.writeAll(")");
                 } else {
@@ -755,13 +754,13 @@ fn emitSerialize(
             try w.writeAll(", native_endian);\n");
         },
         .object => {
-            try w.writeAll("        try writer.writeInt(u32, @intFromEnum(");
+            try w.writeAll("        try writer.writeInt(u32, @backingInt(");
             try writeArgParam(w, arg, enums);
             if (arg.allow_null) try w.writeAll(" orelse .null");
             try w.writeAll("), native_endian);\n");
         },
         .new_id => {
-            try w.writeAll("        try writer.writeInt(u32, @intFromEnum(");
+            try w.writeAll("        try writer.writeInt(u32, @backingInt(");
             try writeArgParam(w, arg, enums);
             try w.writeAll("), native_endian);\n");
         },

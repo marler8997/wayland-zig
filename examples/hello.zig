@@ -1,37 +1,36 @@
-pub fn main() !void {
-    try wl.wsaStartup();
+pub fn main(init: std.process.Init) !void {
+    const io = init.io;
 
     const stream = blk: {
         var err: wl.SockaddrError = undefined;
-        const addr = wl.getSockaddr(&err) catch {
+        const addr = wl.getSockaddr(init.minimal.environ, &err) catch {
             std.log.err("{f}", .{err});
             std.process.exit(0xff);
         };
         std.log.info("connecting to '{f}'", .{addr});
-        break :blk wl.connect(&addr) catch |e| {
+        break :blk wl.connect(io, &addr) catch |e| {
             std.log.err("connect to {f} failed with {s}", .{ addr, @errorName(e) });
             std.process.exit(0xff);
         };
     };
-    defer wl.disconnect(stream);
+    defer wl.disconnect(io, stream);
 
     var write_buf: [4096]u8 = undefined;
-    var stream_writer = stream.writer(&write_buf);
+    var stream_writer = stream.writer(io, &write_buf);
 
     var read_buf: [4096]u8 = undefined;
-    var stream_reader = stream.reader(&read_buf);
+    var stream_reader = stream.reader(io, &read_buf);
 
     var inst_store: Instance.Store = .{};
     var id_recycle_stack: [16]wl.object = undefined;
     var id_pool: wl.IdPool = .{ .next = 1, .recycle_stack = &id_recycle_stack };
-    var zombie_arena: std.heap.ArenaAllocator = .init(std.heap.page_allocator);
     var inst = Instance.init(&stream_writer.interface, &inst_store, &id_pool, .{
-        .zombies = .{ .allocator = zombie_arena.allocator() },
+        .zombies = .{ .allocator = init.gpa },
     });
 
-    return go(stream, &inst, stream_reader.interface()) catch |err| switch (err) {
+    return go(io, stream, &inst, &stream_reader.interface) catch |err| switch (err) {
         error.WriteFailed => stream_writer.err orelse error.Unexpected,
-        error.ReadFailed => stream_reader.getError() orelse error.Unexpected,
+        error.ReadFailed => stream_reader.err orelse error.Unexpected,
         error.EndOfStream,
         error.WaylandProtocol,
         => |e| e,
@@ -54,9 +53,10 @@ const Instance = @import("wl").Instance(&.{
 });
 
 fn go(
-    stream: std.net.Stream,
+    io: std.Io,
+    stream: std.Io.net.Stream,
     inst: *Instance,
-    reader: *wl.Reader,
+    reader: *std.Io.Reader,
 ) error{ WriteFailed, ReadFailed, EndOfStream, WaylandProtocol }!void {
     _ = inst.new(.display);
 
@@ -175,18 +175,18 @@ fn go(
         std.log.err("memfd_create '{s}' failed with {s}", .{ shm_memfd_name, @errorName(e) });
         std.process.exit(0xff);
     };
-    std.posix.ftruncate(shm_fd, shm_size) catch |e| {
+    (std.Io.File{ .handle = shm_fd, .flags = .{ .nonblocking = false } }).setLength(io, shm_size) catch |e| {
         std.log.err("ftruncate failed with {s}", .{@errorName(e)});
         std.process.exit(0xff);
     };
-    const pixels = std.posix.mmap(null, shm_size, std.posix.PROT.READ | std.posix.PROT.WRITE, .{ .TYPE = .SHARED }, shm_fd, 0) catch |e| {
+    const pixels = std.posix.mmap(null, shm_size, .{ .READ = true, .WRITE = true }, .{ .TYPE = .SHARED }, shm_fd, 0) catch |e| {
         std.log.err("mmap failed with {s}", .{@errorName(e)});
         std.process.exit(0xff);
     };
     const pixels_u32: [*]u32 = @ptrCast(@alignCast(pixels.ptr));
 
     try inst.writer.flush();
-    wl.shm.create_pool(stream, inst.get(.shm), inst.new(.shm_pool), shm_fd, @intCast(shm_size)) catch |e| {
+    wl.shm.create_pool(io, stream, inst.get(.shm), inst.new(.shm_pool), shm_fd, @intCast(shm_size)) catch |e| {
         std.log.err("sendmsg with shm fd failed with {s}", .{@errorName(e)});
         std.process.exit(0xff);
     };
@@ -226,7 +226,7 @@ fn go(
         // Wait for frame callback done
         var frame_done = false;
         while (!frame_done) {
-            var poll_fd = [1]std.posix.pollfd{.{ .fd = stream.handle, .events = std.posix.POLL.IN, .revents = 0 }};
+            var poll_fd = [1]std.posix.pollfd{.{ .fd = stream.socket.handle, .events = std.posix.POLL.IN, .revents = 0 }};
             const poll_result = std.posix.poll(&poll_fd, 5000) catch |e| {
                 std.log.err("poll failed with {s}", .{@errorName(e)});
                 std.process.exit(0xff);
@@ -262,7 +262,7 @@ fn go(
 
 fn handleDisplayEvent(
     inst: *Instance,
-    reader: *wl.Reader,
+    reader: *std.Io.Reader,
     opcode: u16,
     size: u16,
 ) error{ ReadFailed, EndOfStream, WaylandProtocol }!void {
@@ -280,7 +280,7 @@ fn handleDisplayEvent(
             return error.WaylandProtocol;
         },
         wl.display.event.delete_id => {
-            const deleted_id: wl.object = @enumFromInt(try reader.takeInt(u32, wl.native_endian));
+            const deleted_id: wl.object = @fromBackingInt(@intCast(try reader.takeInt(u32, wl.native_endian)));
             inst.delete(deleted_id);
         },
         else => {
@@ -292,7 +292,7 @@ fn handleDisplayEvent(
 
 fn handleEvent(
     inst: *Instance,
-    reader: *wl.Reader,
+    reader: *std.Io.Reader,
     sender: wl.object,
     opcode: u16,
     size: u16,

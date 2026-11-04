@@ -15,7 +15,7 @@ pub const IdPool = struct {
         }
         const id = self.next;
         self.next = id + 1;
-        return @enumFromInt(id);
+        return @fromBackingInt(@intCast(id));
     }
 
     /// Returns an ID for reuse, called when processing wl_display.delete_id.
@@ -77,33 +77,27 @@ pub fn Instance(comptime objects: []const Object) type {
         pub const Store = IdMap.Store(capacity);
 
         pub const Kind = blk: {
-            var fields: [capacity]std.builtin.Type.EnumField = undefined;
+            var names: [capacity][]const u8 = undefined;
+            var values: [capacity]E = undefined;
             for (objects, 0..) |obj, i| {
-                fields[i] = .{ .name = obj[0], .value = i };
+                names[i] = obj[0];
+                values[i] = i;
             }
-            break :blk @Type(.{ .@"enum" = .{
-                .tag_type = E,
-                .fields = &fields,
-                .is_exhaustive = true,
-                .decls = &.{},
-            } });
+            break :blk @Enum(E, .exhaustive, &names, &values);
         };
 
         pub const ServerKind = blk: {
-            var fields: [capacity]std.builtin.Type.EnumField = undefined;
+            var names: [capacity][]const u8 = undefined;
+            var values: [capacity]E = undefined;
             var count: usize = 0;
             for (objects, 0..) |obj, i| {
                 if (!obj[1].hasDestructor()) {
-                    fields[count] = .{ .name = obj[0], .value = i };
+                    names[count] = obj[0];
+                    values[count] = i;
                     count += 1;
                 }
             }
-            break :blk @Type(.{ .@"enum" = .{
-                .tag_type = E,
-                .fields = fields[0..count],
-                .is_exhaustive = false,
-                .decls = &.{},
-            } });
+            break :blk @Enum(E, .nonexhaustive, names[0..count], values[0..count]);
         };
 
         pub fn init(writer: *std.Io.Writer, store: *Store, id_pool: *IdPool, opt: struct {
@@ -123,16 +117,16 @@ pub fn Instance(comptime objects: []const Object) type {
 
         /// Allocates a new object ID and maps it to the given kind.
         pub fn new(self: *Self, kind: Kind) object {
-            std.debug.assert(self.inner.getKey(@intFromEnum(kind)) == null);
+            std.debug.assert(self.inner.getKey(@backingInt(kind)) == null);
             const id = self.id_pool.new();
-            self.inner.put(@intFromEnum(id), @intFromEnum(kind));
+            self.inner.put(@backingInt(id), @backingInt(kind));
             return id;
         }
 
         /// Returns the object ID for the given kind (reverse array index).
         pub fn getOpt(self: *const Self, kind: Kind) ?object {
-            const k = self.inner.getKey(@intFromEnum(kind)) orelse return null;
-            return @enumFromInt(k);
+            const k = self.inner.getKey(@backingInt(kind)) orelse return null;
+            return @fromBackingInt(@intCast(k));
         }
 
         /// Returns the object ID for the given kind, panics if not mapped.
@@ -145,20 +139,20 @@ pub fn Instance(comptime objects: []const Object) type {
         /// Returns null for zombie IDs (destroyed but delete_id not yet received).
         /// If zombie tracking is enabled, panics on truly unknown IDs (API misuse).
         pub fn lookup(self: *const Self, key: object) ?Kind {
-            const v = self.inner.get(@intFromEnum(key)) orelse {
+            const v = self.inner.get(@backingInt(key)) orelse {
                 if (self.maybe_zombies) |*zombies| {
                     if (zombies.contains(key)) return null;
-                    std.debug.panic("Instance: unknown object {} (not live and not zombie)", .{@intFromEnum(key)});
+                    std.debug.panic("Instance: unknown object {} (not live and not zombie)", .{@backingInt(key)});
                 }
                 return null;
             };
-            return @enumFromInt(v);
+            return @fromBackingInt(@intCast(v));
         }
 
         /// Remove a server-destroyed object from the map. No zombie tracking
         /// needed since the server initiated the destruction.
         pub fn remove(self: *Self, kind: ServerKind) void {
-            const idx = @intFromEnum(kind);
+            const idx = @backingInt(kind);
             const k = self.inner.getKey(idx) orelse
                 std.debug.panic("Instance: no object for {s}", .{@tagName(kind)});
             std.debug.assert(self.inner.remove(k));
@@ -168,12 +162,12 @@ pub fn Instance(comptime objects: []const Object) type {
         /// from the map and adds it to zombie tracking so that late events
         /// are silently discarded instead of panicking.
         pub fn abandon(self: *Self, kind: ServerKind) void {
-            const idx = @intFromEnum(kind);
+            const idx = @backingInt(kind);
             const k = self.inner.getKey(idx) orelse
                 std.debug.panic("Instance: no object for {s}", .{@tagName(kind)});
             std.debug.assert(self.inner.remove(k));
             if (self.maybe_zombies) |*zombies| {
-                if (!zombies.put(@enumFromInt(k))) {
+                if (!zombies.put(@fromBackingInt(@intCast(k)))) {
                     zombies.oom_handler();
                     zombies.map.deinit(zombies.allocator);
                     self.maybe_zombies = null;
@@ -185,7 +179,7 @@ pub fn Instance(comptime objects: []const Object) type {
         /// zombie tracking if present.
         pub fn delete(self: *Self, key: object) void {
             // ID must already be out of the map (removed by remove() or write(destructor))
-            std.debug.assert(self.inner.get(@intFromEnum(key)) == null);
+            std.debug.assert(self.inner.get(@backingInt(key)) == null);
             if (self.maybe_zombies) |*zombies| {
                 zombies.remove(key);
             }
@@ -208,12 +202,12 @@ pub fn Instance(comptime objects: []const Object) type {
             var full_args: FullArgs = undefined;
             full_args[0] = self.writer;
             full_args[1] = id;
-            inline for (2..@typeInfo(FullArgs).@"struct".fields.len) |i| {
+            inline for (2..@typeInfo(FullArgs).@"struct".field_names.len) |i| {
                 full_args[i] = args[i - 2];
             }
             const result = @call(.auto, func, full_args);
             if (method.isDestructor()) {
-                const k = self.inner.getKey(@intFromEnum(kind)) orelse unreachable;
+                const k = self.inner.getKey(@backingInt(kind)) orelse unreachable;
                 std.debug.assert(self.inner.remove(k));
                 if (self.maybe_zombies) |*zombies| {
                     if (!zombies.put(id)) {
@@ -229,20 +223,9 @@ pub fn Instance(comptime objects: []const Object) type {
         }
 
         fn InterfaceType(comptime kind: Kind) type {
-            return objects[@intFromEnum(kind)][1].Type();
+            return objects[@backingInt(kind)][1].Type();
         }
     };
-}
-
-pub const Writer = std.Io.Writer;
-pub const Reader = std.Io.Reader;
-
-/// Any application that supports windows can call this at
-/// the start of their program to setup initialize WSA (Winsock API).
-pub fn wsaStartup() !void {
-    if (builtin.os.tag == .windows) {
-        _ = try windows.WSAStartup(2, 2);
-    }
 }
 
 const unix_sockaddr_path_offset = @offsetOf(posix.sockaddr.un, "path");
@@ -252,19 +235,11 @@ const unix_sockaddr_path_offset = @offsetOf(posix.sockaddr.un, "path");
 pub const Sockaddr = struct {
     unix: posix.sockaddr.un,
     len: posix.socklen_t,
-    pub const format = if (zig_atleast_15) formatNew else formatLegacy;
-    fn formatNew(addr: *const Sockaddr, writer: *std.Io.Writer) error{WriteFailed}!void {
-        try addr.formatLegacy("", .{}, writer);
+    pub fn format(addr: *const Sockaddr, writer: *std.Io.Writer) error{WriteFailed}!void {
+        try writer.print("{s}", .{addr.path()});
     }
-    fn formatLegacy(
-        addr: *const Sockaddr,
-        comptime fmt: []const u8,
-        options: std.fmt.FormatOptions,
-        writer: anytype,
-    ) !void {
-        _ = fmt;
-        _ = options;
-        try writer.print("{s}", .{addr.unix.path[0 .. addr.len - unix_sockaddr_path_offset]});
+    pub fn path(addr: *const Sockaddr) []const u8 {
+        return addr.unix.path[0 .. addr.len - unix_sockaddr_path_offset];
     }
 };
 
@@ -283,18 +258,7 @@ pub const SockaddrError = union(enum) {
         return error.Sockaddr;
     }
 
-    pub const format = if (zig_atleast_15) formatNew else formatLegacy;
-    fn formatNew(err: *const SockaddrError, writer: *std.Io.Writer) error{WriteFailed}!void {
-        try err.formatLegacy("", .{}, writer);
-    }
-    fn formatLegacy(
-        err: *const SockaddrError,
-        comptime fmt: []const u8,
-        options: std.fmt.FormatOptions,
-        writer: anytype,
-    ) !void {
-        _ = fmt;
-        _ = options;
+    pub fn format(err: *const SockaddrError, writer: *std.Io.Writer) error{WriteFailed}!void {
         switch (err.*) {
             .wayland_display_too_long => |d| try writer.print("WAYLAND_DISPLAY environment variable '{s}' is too long", .{d}),
             .xdg_runtime_dir_too_long => |d| try writer.print("XDG_RUNTIME_DIR environment variable '{s}' is too long", .{d}),
@@ -307,13 +271,13 @@ pub const SockaddrError = union(enum) {
 
 /// Retrieves the path to the Wayland socket file based on the WAYLAND_DISPLAY
 /// and XDG_RUNTIME_DIR environment variables.
-pub fn getSockaddr(out_err: *SockaddrError) error{Sockaddr}!Sockaddr {
+pub fn getSockaddr(environ: std.process.Environ, out_err: *SockaddrError) error{Sockaddr}!Sockaddr {
     var result: Sockaddr = .{
         .unix = .{ .path = undefined },
         .len = 0,
     };
     const maybe_wayland_display: ?[:0]const u8 = blk: {
-        if (posix.getenv("WAYLAND_DISPLAY")) |wayland_display| {
+        if (environ.getPosix("WAYLAND_DISPLAY")) |wayland_display| {
             if (wayland_display.len + 1 > result.unix.path.len) return out_err.set(.{
                 .wayland_display_too_long = wayland_display,
             });
@@ -328,10 +292,10 @@ pub fn getSockaddr(out_err: *SockaddrError) error{Sockaddr}!Sockaddr {
         break :blk null;
     };
 
-    if (posix.getenv("XDG_RUNTIME_DIR")) |xdg_runtime_dir| {
+    if (environ.getPosix("XDG_RUNTIME_DIR")) |xdg_runtime_dir| {
         if (xdg_runtime_dir.len + 1 > result.unix.path.len) return out_err.set(.{ .xdg_runtime_dir_too_long = xdg_runtime_dir });
         const wayland_display = maybe_wayland_display orelse "wayland-0";
-        const slice = std.fmt.bufPrintZ(&result.unix.path, "{s}/{s}", .{ xdg_runtime_dir, wayland_display }) catch |err| switch (err) {
+        const slice = std.mem.printSentinel(&result.unix.path, "{s}/{s}", .{ xdg_runtime_dir, wayland_display }, 0) catch |err| switch (err) {
             error.NoSpaceLeft => return out_err.set(.{ .path_too_long = .{
                 .xdg_runtime_dir = xdg_runtime_dir,
                 .wayland_display = wayland_display,
@@ -347,26 +311,38 @@ pub fn getSockaddr(out_err: *SockaddrError) error{Sockaddr}!Sockaddr {
 }
 
 /// Just a convenience function to create/connect a unix socket to the given unix sockaddr.
-pub const ConnectError = posix.SocketError || posix.ConnectError;
-pub fn connect(addr: *const Sockaddr) ConnectError!std.net.Stream {
-    const sockfd = try posix.socket(
-        posix.AF.UNIX,
-        posix.SOCK.STREAM | posix.SOCK.CLOEXEC,
-        0,
-    );
-    errdefer std.net.Stream.close(.{ .handle = sockfd });
-    try posix.connect(sockfd, @ptrCast(&addr.unix), addr.len);
-    return .{ .handle = sockfd };
+pub const ConnectError = std.Io.net.UnixAddress.InitError || std.Io.net.UnixAddress.ConnectError;
+pub fn connect(io: std.Io, addr: *const Sockaddr) ConnectError!std.Io.net.Stream {
+    const unix_addr: std.Io.net.UnixAddress = try .init(addr.path());
+    return unix_addr.connect(io);
 }
 
-pub fn disconnect(stream: std.net.Stream) void {
-    posix.shutdown(stream.handle, .both) catch {}; // ignore any error here
-    stream.close();
+pub fn disconnect(io: std.Io, stream: std.Io.net.Stream) void {
+    stream.shutdown(io, .both) catch {}; // ignore any error here
+    stream.close(io);
+}
+
+/// Writes a request whose only fd argument is sent via SCM_RIGHTS.
+fn writeWithFd(io: std.Io, stream: std.Io.net.Stream, request: []const u8, fd: posix.fd_t) !void {
+    const cmsg: Cmsg(posix.fd_t) = .{
+        .level = posix.SOL.SOCKET,
+        .type = 1, // SCM_RIGHTS
+        .data = fd,
+    };
+    const sent = try (try io.operate(.{ .net_write = .{
+        .socket_handle = stream.socket.handle,
+        .data = &.{request},
+        .control = std.mem.asBytes(&cmsg)[0..cmsg.len],
+    } })).net_write;
+    if (sent != request.len) {
+        std.log.err("expected to send {} bytes but only sent {}", .{ request.len, sent });
+        return error.WriteTruncated;
+    }
 }
 
 // returns the sender object/opcode/size
-pub fn readHeader(reader: *Reader) error{ ReadFailed, EndOfStream }!struct { object, u16, u16 } {
-    const sender: object = @enumFromInt(try reader.takeInt(u32, native_endian));
+pub fn readHeader(reader: *std.Io.Reader) error{ ReadFailed, EndOfStream }!struct { object, u16, u16 } {
+    const sender: object = @fromBackingInt(@intCast(try reader.takeInt(u32, native_endian)));
     const second: SizeOpcode = @bitCast(try reader.takeInt(u32, native_endian));
     return .{ sender, second.opcode, second.size };
 }
@@ -424,34 +400,13 @@ pub const shm = struct {
     pub const event = generated.shm.event;
 
     // create_pool requires fd passing via sendmsg
-    pub fn create_pool(stream: std.net.Stream, shm_id: object, pool_id: object, fd: std.posix.fd_t, size: u32) !void {
+    pub fn create_pool(io: std.Io, stream: std.Io.net.Stream, shm_id: object, pool_id: object, fd: std.posix.fd_t, size: u32) !void {
         var request: [16]u8 = undefined;
-        std.mem.writeInt(u32, request[0..4], @intFromEnum(shm_id), native_endian);
+        std.mem.writeInt(u32, request[0..4], @backingInt(shm_id), native_endian);
         std.mem.writeInt(u32, request[4..8], @bitCast(SizeOpcode{ .size = request.len, .opcode = 0 }), native_endian);
-        std.mem.writeInt(u32, request[8..12], @intFromEnum(pool_id), native_endian);
+        std.mem.writeInt(u32, request[8..12], @backingInt(pool_id), native_endian);
         std.mem.writeInt(u32, request[12..16], size, native_endian);
-        const iov = [_]std.posix.iovec_const{
-            .{ .base = &request, .len = request.len },
-        };
-        const cmsg: Cmsg(std.posix.fd_t) = .{
-            .level = std.posix.SOL.SOCKET,
-            .type = 1, // SCM_RIGHTS
-            .data = fd,
-        };
-        const msg: std.posix.msghdr_const = .{
-            .name = null,
-            .namelen = 0,
-            .iov = &iov,
-            .iovlen = iov.len,
-            .control = &cmsg,
-            .controllen = cmsg.len,
-            .flags = 0,
-        };
-        const sent = try std.posix.sendmsg(stream.handle, &msg, 0);
-        if (sent != 16) {
-            std.log.err("create_pool: expected to send 16 bytes but only sent {}", .{sent});
-            return error.WriteTruncated;
-        }
+        try writeWithFd(io, stream, &request, fd);
     }
 
     // release: generated as normal (no fd)
@@ -468,7 +423,8 @@ pub const linux_buffer_params = struct {
 
     /// Add a dmabuf plane. The fd is sent via SCM_RIGHTS using sendmsg.
     pub fn add(
-        stream: std.net.Stream,
+        io: std.Io,
+        stream: std.Io.net.Stream,
         params_id: object,
         fd: posix.fd_t,
         plane_idx: u32,
@@ -478,7 +434,7 @@ pub const linux_buffer_params = struct {
         modifier_lo: u32,
     ) !void {
         var request: [32]u8 = undefined;
-        std.mem.writeInt(u32, request[0..4], @intFromEnum(params_id), native_endian);
+        std.mem.writeInt(u32, request[0..4], @backingInt(params_id), native_endian);
         std.mem.writeInt(u32, request[4..8], @bitCast(SizeOpcode{ .size = request.len, .opcode = 1 }), native_endian);
         std.mem.writeInt(u32, request[8..12], plane_idx, native_endian);
         std.mem.writeInt(u32, request[12..16], offset, native_endian);
@@ -486,28 +442,7 @@ pub const linux_buffer_params = struct {
         std.mem.writeInt(u32, request[20..24], modifier_hi, native_endian);
         std.mem.writeInt(u32, request[24..28], modifier_lo, native_endian);
         std.mem.writeInt(u32, request[28..32], 0, native_endian);
-        const iov = [_]posix.iovec_const{
-            .{ .base = &request, .len = request.len },
-        };
-        const cmsg: Cmsg(posix.fd_t) = .{
-            .level = posix.SOL.SOCKET,
-            .type = 1, // SCM_RIGHTS
-            .data = fd,
-        };
-        const msg: posix.msghdr_const = .{
-            .name = null,
-            .namelen = 0,
-            .iov = &iov,
-            .iovlen = iov.len,
-            .control = &cmsg,
-            .controllen = cmsg.len,
-            .flags = 0,
-        };
-        const sent = try posix.sendmsg(stream.handle, &msg, 0);
-        if (sent != request.len) {
-            std.log.err("linux_dmabuf_params.add: expected to send {} bytes but sent {}", .{ request.len, sent });
-            return error.WriteTruncated;
-        }
+        try writeWithFd(io, stream, &request, fd);
     }
 };
 
@@ -518,7 +453,7 @@ pub fn Cmsg(comptime T: type) type {
         level: c_int,
         type: c_int,
         data: T,
-        _padding: [padding_size]u8 align(1) = [1]u8{0} ** padding_size,
+        _padding: [padding_size]u8 align(1) = @splat(0),
     };
 }
 
@@ -533,10 +468,6 @@ fn padLen(comptime align_to: comptime_int, len: Pad(align_to)) Pad(align_to) {
     return (0 -% len) & (align_to - 1);
 }
 
-pub const zig_atleast_15 = @import("builtin").zig_version.order(.{ .major = 0, .minor = 15, .patch = 0 }) != .lt;
-
-const builtin = @import("builtin");
 const std = @import("std");
 const posix = std.posix;
-const windows = std.os.windows;
 const generated = @import("generated");
