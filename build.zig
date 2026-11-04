@@ -71,6 +71,7 @@ pub fn build(b: *std.Build) void {
             run.addArgs(args);
         }
         b.step(example_name, "").dependOn(&run.step);
+        test_step.dependOn(&run.step);
     }
 
     const test_non_interactive = b.step("test-non-interactive", "Run unit tests (excluding interactive examples)");
