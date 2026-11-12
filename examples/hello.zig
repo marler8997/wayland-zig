@@ -3,7 +3,7 @@ pub fn main(init: std.process.Init) !void {
 
     const stream = blk: {
         var err: wl.SockaddrError = undefined;
-        const addr = wl.getSockaddr(init.minimal.environ, &err) catch {
+        const addr = wl.getSockaddr(.init(init.minimal.environ), &err) catch {
             std.log.err("{f}", .{err});
             std.process.exit(0xff);
         };
