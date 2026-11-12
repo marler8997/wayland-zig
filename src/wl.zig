@@ -269,20 +269,33 @@ pub const SockaddrError = union(enum) {
     }
 };
 
+/// The environment variables getSockaddr reads.
+pub const SockaddrEnv = struct {
+    WAYLAND_DISPLAY: ?[:0]const u8,
+    XDG_RUNTIME_DIR: ?[:0]const u8,
+
+    pub fn init(environ: std.process.Environ) SockaddrEnv {
+        return .{
+            .WAYLAND_DISPLAY = environ.getPosix("WAYLAND_DISPLAY"),
+            .XDG_RUNTIME_DIR = environ.getPosix("XDG_RUNTIME_DIR"),
+        };
+    }
+};
+
 /// Retrieves the path to the Wayland socket file based on the WAYLAND_DISPLAY
 /// and XDG_RUNTIME_DIR environment variables.
-pub fn getSockaddr(environ: std.process.Environ, out_err: *SockaddrError) error{Sockaddr}!Sockaddr {
+pub fn getSockaddr(env: SockaddrEnv, out_err: *SockaddrError) error{Sockaddr}!Sockaddr {
     var result: Sockaddr = .{
         .unix = .{ .path = undefined },
         .len = 0,
     };
     const maybe_wayland_display: ?[:0]const u8 = blk: {
-        if (environ.getPosix("WAYLAND_DISPLAY")) |wayland_display| {
+        if (env.WAYLAND_DISPLAY) |wayland_display| {
             if (wayland_display.len + 1 > result.unix.path.len) return out_err.set(.{
                 .wayland_display_too_long = wayland_display,
             });
             if (std.fs.path.isAbsolute(wayland_display)) {
-                @memcpy(&result.unix.path, wayland_display);
+                @memcpy(result.unix.path[0..wayland_display.len], wayland_display);
                 result.unix.path[wayland_display.len] = 0;
                 result.len = @intCast(unix_sockaddr_path_offset + wayland_display.len);
                 return result;
@@ -292,7 +305,7 @@ pub fn getSockaddr(environ: std.process.Environ, out_err: *SockaddrError) error{
         break :blk null;
     };
 
-    if (environ.getPosix("XDG_RUNTIME_DIR")) |xdg_runtime_dir| {
+    if (env.XDG_RUNTIME_DIR) |xdg_runtime_dir| {
         if (xdg_runtime_dir.len + 1 > result.unix.path.len) return out_err.set(.{ .xdg_runtime_dir_too_long = xdg_runtime_dir });
         const wayland_display = maybe_wayland_display orelse "wayland-0";
         const slice = std.mem.printSentinel(&result.unix.path, "{s}/{s}", .{ xdg_runtime_dir, wayland_display }, 0) catch |err| switch (err) {
@@ -466,6 +479,36 @@ pub fn Pad(align_to: comptime_int) type {
 }
 fn padLen(comptime align_to: comptime_int, len: Pad(align_to)) Pad(align_to) {
     return (0 -% len) & (align_to - 1);
+}
+
+test "getSockaddr absolute WAYLAND_DISPLAY" {
+    var err: SockaddrError = undefined;
+    const block = [_:null]?[*:0]const u8{ "WAYLAND_DISPLAY=/tmp/wl-abs", "XDG_RUNTIME_DIR=/run/user/7" };
+    const addr = try getSockaddr(.init(.{ .block = .{ .slice = &block } }), &err);
+    try std.testing.expectEqualStrings("/tmp/wl-abs", addr.path());
+}
+
+test getSockaddr {
+    var err: SockaddrError = undefined;
+    const Case = struct { SockaddrEnv, []const u8 };
+    for ([_]Case{
+        .{ .{ .WAYLAND_DISPLAY = "wayland-1", .XDG_RUNTIME_DIR = "/run/user/1000" }, "/run/user/1000/wayland-1" },
+        .{ .{ .WAYLAND_DISPLAY = null, .XDG_RUNTIME_DIR = "/run/user/1000" }, "/run/user/1000/wayland-0" },
+    }) |case| {
+        const addr = try getSockaddr(case[0], &err);
+        try std.testing.expectEqualStrings(case[1], addr.path());
+    }
+    try std.testing.expectError(error.Sockaddr, getSockaddr(.{ .WAYLAND_DISPLAY = "wayland-1", .XDG_RUNTIME_DIR = null }, &err));
+    try std.testing.expectEqualStrings("wayland-1", err.wayland_display_no_xdg);
+    try std.testing.expectError(error.Sockaddr, getSockaddr(.{ .WAYLAND_DISPLAY = null, .XDG_RUNTIME_DIR = null }, &err));
+    try std.testing.expect(err == .no_wayland_display_and_xdg);
+}
+
+test "SockaddrEnv.init" {
+    var err: SockaddrError = undefined;
+    const block = [_:null]?[*:0]const u8{ "HOME=/home/me", "XDG_RUNTIME_DIR=/run/user/7", "WAYLAND_DISPLAY=wayland-3" };
+    const addr = try getSockaddr(.init(.{ .block = .{ .slice = &block } }), &err);
+    try std.testing.expectEqualStrings("/run/user/7/wayland-3", addr.path());
 }
 
 const std = @import("std");
